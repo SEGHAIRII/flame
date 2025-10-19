@@ -236,8 +236,80 @@ class GLATPPlan(TPPlan):
             "attn.o_proj": self.rowwise_parallel(output_layouts=Shard(1)),
         }
 
+class AudioMamba2TPPlan(TPPlan):
 
-TP_PLAN_MAP = {"transformer": TransformerTPPlan, "gla": GLATPPlan}
+    @property
+    def model_plan(self):
+        """Model-level parallelization for AudioMamba2"""
+        plans = {
+            # Input projection: replicate input, shard output along sequence
+            "input_projection": self.rowwise_parallel(
+                input_layouts=Replicate(),
+                output_layouts=Shard(1),
+            ),
+            # Final norm: sequence parallel
+            "norm": SequenceParallel(),
+            # Output projection: prepare input, replicate output
+            "output_projection": self.prepare_module_input(
+                input_layouts=(Shard(1),),
+                desired_input_layouts=(Replicate(),),
+            ),
+        }
+        
+        # Loss function
+        if self.loss_parallel:
+            plans.update({
+                "criterion": LinearLossParallel(),
+            })
+        else:
+            plans.update({
+                "criterion": PrepareModuleWeight(layouts=Replicate()),
+            })
+        
+        return plans
+
+    @property
+    def layer_plan(self):
+        """
+        Layer-by-layer parallelization for Mamba2Block.
+        Mamba2Block doesn't have attn_norm/mlp_norm structure,
+        so we directly parallelize its internal components.
+        """
+        return {
+            # Mamba2Block uses a single norm at the beginning
+            "norm": SequenceParallel(sequence_dim=-1),
+            # Prepare input for the block
+            "": self.prepare_module_input(
+                input_kwarg_layouts={"hidden_states": Shard(1)},
+                desired_input_kwarg_layouts={"hidden_states": Replicate()},
+            ),
+            # in_proj: combines q, k, v projections (column-wise parallel)
+            "in_proj": self.colwise_parallel(),
+            # conv1d: temporal convolution (replicate - small, hard to parallelize)
+            "conv1d.weight": PrepareModuleWeight(layouts=Replicate()),
+            "conv1d.bias": PrepareModuleWeight(layouts=Replicate()),
+            # dt_proj: delta time projection (column-wise parallel)
+            "dt_proj": self.colwise_parallel(),
+            # State space parameters (replicate - shared state)
+            "A_log": PrepareModuleWeight(layouts=Replicate()),
+            "D": PrepareModuleWeight(layouts=Replicate()),
+            # norm_mamba_states if exists
+            "norm_mamba_states": SequenceParallel(sequence_dim=-1),
+            # Output projection (row-wise parallel)
+            "out_proj": self.rowwise_parallel(output_layouts=Shard(1)),
+        }
+
+    @property
+    def attn_plan(self):
+        """Not used - Mamba2Block doesn't have separate attn"""
+        return {}
+
+    @property
+    def mlp_plan(self):
+        """Not used - Mamba2Block doesn't have separate MLP"""
+        return {}
+
+TP_PLAN_MAP = {"transformer": TransformerTPPlan, "gla": GLATPPlan, 'audiomamba2': AudioMamba2TPPlan}
 
 
 def apply_tp(
@@ -383,7 +455,7 @@ def apply_compile(model: nn.Module):
 
     real_model = get_model(model)
 
-    logger.info("Compiling the embedding, norm, and lm_head layers with torch.compile")
+    logger.info("Compiling the embedding,lm_head layers (text), input_projection, output_projection(audio) and norm with torch.compile")
     embeddings_key = get_components_name(real_model, "tok_embeddings")
     if embeddings_key is not None:
         embeddings = torch.compile(getattr(real_model, embeddings_key), fullgraph=True)
@@ -488,6 +560,8 @@ def apply_ddp(
 
 def get_model(model):
     base_model_prefix = getattr(model, "base_model_prefix", "model")
+    if base_model_prefix == "":
+        return model
     if not hasattr(model, base_model_prefix):
         return None
     model = getattr(model, base_model_prefix)
@@ -527,9 +601,13 @@ def get_components_name(model, component_name):
             return "embed_tokens"
         elif hasattr(model, "embeddings"):
             return "embeddings"
+        elif hasattr(model, "input_projection"):
+            return "input_projection"
         else:
             logger.warning("No tok_embeddings found in model")
             return None
+        
+    
 
     elif component_name == "norm":
         if hasattr(model, "norm"):
@@ -545,6 +623,8 @@ def get_components_name(model, component_name):
     elif component_name == "lm_head":
         if hasattr(model, "lm_head"):
             return "lm_head"
+        elif hasattr(model, "output_projection"):
+            return "output_projection"
         else:
             logger.warning("No lm_head found in model")
             return None

@@ -1,0 +1,44 @@
+{
+  "model_type": "audio_attention",
+  
+  "_comment_model_arch": "Model architecture parameters",
+  "num_hidden_layers": 3,
+  "hidden_size": 256,
+  
+  "_comment_attention": "Multi-head attention parameters",
+  "num_attention_heads": 8,
+  "attention_dropout": 0.1,
+  
+  "_comment_ffn": "Feed-forward network parameters",
+  "intermediate_size": 1024,
+  "hidden_dropout": 0.1,
+  
+  "_comment_activation": "Activation and normalization",
+  "hidden_act": "gelu",
+  "layer_norm_eps": 1e-5,
+  
+  "_comment_position": "Positional encoding settings",
+  "max_position_embeddings": 4096,
+  "use_positional_encoding": true,
+  "positional_encoding_type": "learnable",
+  
+  "_comment_audio": "Audio-specific parameters",
+  "n_mels": 80,
+  "n_fft": 2048,
+  "hop_length": 512,
+  "sample_rate": 16000,
+  "use_mel": true,
+  "use_magnitude": true,
+  "use_phase": false,
+  "use_complex": false,
+  
+  "_comment_training": "Training parameters",
+  "loss_type": "mse",
+  "initializer_range": 0.02,
+  "use_cache": false,
+  
+  "_comment_compat": "Compatibility parameters",
+  "fuse_norm": false,
+  "fuse_linear_cross_entropy": false,
+  "vocab_size": 1
+}

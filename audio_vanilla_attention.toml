@@ -1,0 +1,160 @@
+# ============================================================================
+# Job Configuration
+# ============================================================================
+[job]
+description = "vanilla attention audio denoising - debug training"
+task = "audio_denoising"
+print_args = true
+use_for_integration_test = false
+
+# ============================================================================
+# Model Configuration
+# ============================================================================
+[model]
+name = "audio_denoising_fla"
+config = "configs/vanilla_attention.json"
+tokenizer_path = "" 
+norm_type = "rmsnorm"
+
+# ============================================================================
+# Training Configuration
+# ============================================================================
+[training]
+# Dataset
+dataset = "json"
+data_files = "data/audio_denoise/train.json"
+streaming = false
+
+# Audio parameters
+n_fft = 2048
+hop_length = 512
+n_mels = 80
+sample_rate = 16000
+
+# Sequence length
+seq_len = 934
+context_len = 934
+time_steps = 934
+
+# Training hyperparameters
+batch_size = 100
+steps = 1000
+warmup_steps = 100
+seed = 42
+
+# Parallelism
+data_parallel_degree = 1
+data_parallel_shard_degree = 1
+data_parallel_replicate_degree = 1
+tensor_parallel_degree = 1
+enable_loss_parallel = false
+disable_loss_parallel = true
+
+# Mixed precision
+mixed_precision_param = "bfloat16"
+mixed_precision_reduce = "float32"
+
+# Gradient settings
+gradient_accumulation_steps = 1
+max_norm = 5.0
+
+# Data loading
+num_workers = 2
+pin_memory = false
+persistent_workers = false
+
+# Other settings
+compile = false
+varlen = false
+gc_freq = 10
+deterministic = false
+enable_cpu_offload = false
+skip_nan_inf = false
+
+# ============================================================================
+# Optimizer Configuration
+# ============================================================================
+[optimizer]
+name = "AdamW"
+lr = 0.0003  # ✅ Use decimal, not 3e-4
+beta1 = 0.9
+beta2 = 0.999
+eps = 0.00000001  # ✅ Use decimal, not 1e-8
+weight_decay = 0.01
+foreach = true
+fused = false
+
+# ============================================================================
+# Learning Rate Scheduler
+# ============================================================================
+[lr_scheduler]
+name = "cosine"
+min_lr = 0.00003  # ✅ Use decimal, not 3e-5
+warmup_steps = 100
+
+# ============================================================================
+# Activation Checkpointing
+# ============================================================================
+[activation_checkpoint]
+mode = "none"
+selective_ac_option = "op"
+
+# ============================================================================
+# Checkpointing
+# ============================================================================
+[checkpoint]
+enable_checkpoint = true
+folder = "checkpoints/audiomamba2_debug"
+interval = 100
+model_weights_only = false
+export_dtype = "bfloat16"
+async_mode = "disabled"
+create_seed_checkpoint = false
+load_step = -1
+
+# ============================================================================
+# Metrics & Logging
+# ============================================================================
+[metrics]
+log_freq = 10
+enable_tensorboard = true
+save_tb_folder = "tb_logs/audiomamba2_debug"
+enable_color_printing = true
+disable_color_printing = false
+rank_0_only = true
+tag = "audiomamba2_debug"
+
+# ============================================================================
+# Profiling
+# ============================================================================
+[profiling]
+enable_profiling = false
+save_traces_folder = "profile_traces/audiomamba2_debug"
+profile_freq = 100
+enable_memory_snapshot = false
+save_memory_snapshot_folder = "memory_snapshots/audiomamba2_debug"
+
+# ============================================================================
+# Communication
+# ============================================================================
+[comm]
+init_timeout_seconds = 300
+train_timeout_seconds = 100
+
+# ============================================================================
+# Experimental Features
+# ============================================================================
+[experimental]
+pipeline_parallel_degree = 1
+context_parallel_degree = 1
+context_parallel_rotate_method = "ring"
+enable_compiled_autograd = false
+custom_model_path = ""
+
+# ============================================================================
+# Float8
+# ============================================================================
+[float8]
+enable_float8_linear = false
+enable_fsdp_float8_all_gather = false
+precompute_float8_dynamic_scale_for_fsdp = false

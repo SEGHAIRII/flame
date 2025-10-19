@@ -8,6 +8,11 @@ import json
 import os
 import time
 from datetime import timedelta
+from pathlib import Path
+import sys
+
+project_root = Path(__file__).parent.parent
+sys.path.insert(0, str(project_root))
 
 import fla  # noqa
 import torch
@@ -27,7 +32,7 @@ from torchtitan.protocols.train_spec import TrainSpec, get_train_spec, register_
 from torchtitan.tools import utils
 from torchtitan.tools.logging import init_logger, logger
 from torchtitan.tools.profiling import maybe_enable_memory_snapshot, maybe_enable_profiling
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, AutoModel, AutoConfig
 
 import custom_models
 from flame.components.checkpoint import TrainState
@@ -41,7 +46,11 @@ from flame.tools.utils import get_nparams_and_flops
 def build_tokenizer(job_config: JobConfig) -> AutoTokenizer:
     return AutoTokenizer.from_pretrained(job_config.model.tokenizer_path)
 
+# to do : see the loss function
+# modify the flops per token calculation...
 
+
+# Register all causal lm models
 register_train_spec(
     TrainSpec(
         name="fla",
@@ -57,8 +66,26 @@ register_train_spec(
     )
 )
 
+# Register all audio denoising models
+
+register_train_spec(
+    TrainSpec(
+        name="audio_denoising_fla",
+        cls=AutoModel,
+        config=AutoConfig,
+        parallelize_fn=parallelize_fla,
+        pipelining_fn=pipeline_fla,
+        build_optimizers_fn=build_optimizers,
+        build_lr_schedulers_fn=build_lr_schedulers,
+        build_dataloader_fn=build_dataloader,
+        build_tokenizer_fn=None,
+        build_loss_fn=None,
+    )
+)
 
 # Enable debug tracing on failure: https://pytorch.org/docs/stable/elastic/errors.html
+
+
 @record
 def main(job_config: JobConfig):
     logger.info(f"Starting job: {job_config.job.description}")
@@ -133,6 +160,8 @@ def main(job_config: JobConfig):
         """
         pp_mesh = world_mesh["pp"]
 
+    else:
+        pp_mesh = None
     # Set random seed, and maybe enable deterministic mode (mainly for debugging, expect perf loss)
     dist_utils.set_determinism(
         world_mesh, device, job_config.training.seed, job_config.training.deterministic
@@ -140,19 +169,27 @@ def main(job_config: JobConfig):
     train_spec = get_train_spec(job_config.model.name)
 
     logger.info("Loading tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained(
-        job_config.model.tokenizer_path,
-        trust_remote_code=True,
-        model_max_length=int(1e10),
-    )
-    logger.info(f"{tokenizer}")
-    logger.info(
+    if job_config.job.task == "text":
+        tokenizer = AutoTokenizer.from_pretrained(
+            job_config.model.tokenizer_path,
+            trust_remote_code=True,
+            model_max_length=int(1e10),
+        )
+        logger.info(f"{tokenizer}")
+        logger.info(
         f"Loading dataset {job_config.training.dataset}"
         f":{job_config.training.dataset_name}"
         if job_config.training.dataset_name is not None
         else ""
     )
+    else:
+        logger.info('''Audio denoising task does not require tokenizer.
+                      skipping this part/''')
+        tokenizer = None
+        
+        
     dataset = build_dataset(
+        task= job_config.job.task,
         dataset=job_config.training.dataset,
         dataset_name=job_config.training.dataset_name,
         dataset_split=job_config.training.dataset_split,
@@ -164,22 +201,46 @@ def main(job_config: JobConfig):
         num_workers=job_config.training.num_workers,
         seed=job_config.training.seed,
     )
+        
 
     logger.info("Building dataloader...")
-    dataloader = build_dataloader(
-        dataset=dataset,
-        tokenizer=tokenizer,
-        rank=dp_rank,
-        world_size=dp_degree,
-        batch_size=job_config.training.batch_size,
-        seq_len=job_config.training.seq_len,
-        context_len=job_config.training.context_len,
-        varlen=job_config.training.varlen,
-        num_workers=job_config.training.num_workers,
-        pin_memory=job_config.training.pin_memory,
-        persistent_workers=job_config.training.persistent_workers,
-        snapshot_every_n_steps=job_config.checkpoint.interval,
-    )
+    
+    
+    if job_config.job.task == "text":
+        dataloader_args = {
+            "task": job_config.job.task,
+            "dataset": dataset,
+            "tokenizer": tokenizer,
+            "rank": dp_rank,
+            "world_size": dp_degree,
+            "batch_size": job_config.training.batch_size,
+            "seq_len": job_config.training.seq_len,
+            "context_len": job_config.training.context_len,
+            "varlen": job_config.training.varlen,
+            "num_workers": job_config.training.num_workers,
+            "pin_memory": job_config.training.pin_memory,
+            "persistent_workers": job_config.training.persistent_workers,
+            "snapshot_every_n_steps": job_config.checkpoint.interval,
+        }
+        
+    else:
+        dataloader_args = {
+            "task": job_config.job.task,
+            "dataset":dataset,
+            "n_fft": job_config.training.n_fft,
+            "hop_length": job_config.training.hop_length,
+            "n_mels": job_config.training.n_mels,
+            "sample_rate": job_config.training.sample_rate, 
+            "rank": dp_rank,
+            "world_size": dp_degree,
+            "batch_size": job_config.training.batch_size,
+            "num_workers": job_config.training.num_workers,
+            "pin_memory": job_config.training.pin_memory,
+            "persistent_workers": job_config.training.persistent_workers,
+            "snapshot_every_n_steps": job_config.checkpoint.interval,
+        }
+
+    dataloader = build_dataloader(**dataloader_args)
 
     logger.info(f"Loading model config from {job_config.model.config}")
     model_config = AutoConfig.from_pretrained(job_config.model.config)
@@ -205,13 +266,18 @@ def main(job_config: JobConfig):
                 f"{color.reset}"
             )
             model_config.fuse_linear_cross_entropy = False
-    model_config.vocab_size = max(tokenizer.vocab_size, model_config.vocab_size)
+    # use in audio for compatability
+    if job_config.job.task == "text":
+        model_config.vocab_size = max(tokenizer.vocab_size, model_config.vocab_size)
 
     logger.info(
         f"Building model from the config\n{color.green}{model_config}{color.reset}"
     )
     with torch.device("meta"):
-        model = AutoModelForCausalLM.from_config(model_config)
+        if job_config.job.task == "text":
+            model = AutoModelForCausalLM.from_config(model_config)
+        else:
+            model = AutoModel.from_config(model_config)
         if (
             getattr(model_config, "fuse_linear_cross_entropy", False)
             and FusedLinearCrossEntropyLoss is not None
@@ -228,6 +294,7 @@ def main(job_config: JobConfig):
     model_converters.convert(model)
 
     # calculate model size and flops per token
+    #skip for audio for now
     model_param_count, num_flops_per_token = get_nparams_and_flops(
         model, model_config, job_config.training.context_len
     )
@@ -327,7 +394,8 @@ def main(job_config: JobConfig):
     checkpoint.load(step=job_config.checkpoint.load_step)
     metric_logger = build_metrics_processor(job_config, parallel_dims)
     # Set dependent attributes for metric_logger
-    metric_logger.num_flops_per_token = num_flops_per_token
+    if job_config.job.task == "text":
+        metric_logger.num_flops_per_token = num_flops_per_token
     metric_logger.optimizers = optimizers  # Pass optimizers if needed by logger logic
     metric_logger.lr_schedulers = (
         lr_schedulers  # Pass schedulers if needed by logger logic
@@ -413,7 +481,10 @@ def main(job_config: JobConfig):
                 # get batch
                 data_load_start = time.perf_counter()
                 batch = next(data_iterator)
-                input_ids, labels = batch["input_ids"], batch["labels"]
+                if job_config.job.task == "text":
+                    input_ids, labels = batch["input_ids"], batch["labels"]
+                else:
+                    input_ids, labels = batch["noisy_specto"], batch["clean_specto"]
 
                 # Update metrics processor state before forward/backward
                 metric_logger.ntokens_since_last_log += labels.numel()
@@ -444,11 +515,15 @@ def main(job_config: JobConfig):
                 if cu_seqlens is not None:
                     position_ids = prepare_position_ids(cu_seqlens).to(torch.int32)
                 else:
-                    position_ids = (
-                        torch.arange(0, input_ids.shape[1], device=device_type)
-                        .repeat(input_ids.shape[0], 1)
-                        .to(torch.int32)
-                    )
+                    if job_config.job.task == "audio_denoising":
+                        # for audio denoising, we do not use position_ids
+                        position_ids = None
+                    else:
+                        position_ids = (
+                            torch.arange(0, input_ids.shape[1], device=device_type)
+                            .repeat(input_ids.shape[0], 1)
+                            .to(torch.int32)
+                        )
                 # apply context parallelism if cp is enabled
                 # ensure CP handles the separate freqs_cis buffer for each pp stage
                 optional_context_parallel_ctx = (
@@ -572,16 +647,16 @@ def main(job_config: JobConfig):
                     * (job_config.training.steps - train_state.step)
                     / train_state.step
                 )
-                metric_logger.log(
-                    train_state.step,
-                    global_avg_loss,
-                    global_max_loss,
-                    extra_metrics={
-                        "optimizer/lr": last_lr,
-                        "optimizer/grad_norm": grad_norm.item(),
-                        "optimizer/skipped_step": train_state.skipped_step,
-                    },
-                )
+                # metric_logger.log(
+                #     train_state.step,
+                #     global_avg_loss,
+                #     global_max_loss,
+                #     extra_metrics={
+                #         "optimizer/lr": last_lr,
+                #         "optimizer/grad_norm": grad_norm.item(),
+                #         "optimizer/skipped_step": train_state.skipped_step,
+                #     },
+                # )
 
                 logger.info(
                     f"{color.blue}lr: {last_lr:.4e} gnorm: {grad_norm:5.2f} "

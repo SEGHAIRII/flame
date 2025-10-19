@@ -75,6 +75,14 @@ class JobConfig:
             default=None,
             help="Job config file",
         )
+        
+        self.parser.add_argument(
+            "--job.task",
+            type=str,
+            default="text",
+            choices=["text", "audio"],
+            help="what type of task to run (audio denoising or text generation)",
+        )
 
         # job level configs
         self.parser.add_argument(
@@ -920,9 +928,9 @@ class JobConfig:
         return args_dict
 
     def _validate_config(self) -> None:
-        # TODO: Add more mandatory validations
         assert self.model.config
-        assert self.model.tokenizer_path
+        if self.job.task == "text":
+            assert self.model.tokenizer_path
 
     def _get_string_list_argument_names(self) -> list[str]:
         """Get the parser argument names of type `string_list`."""

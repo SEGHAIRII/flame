@@ -1,0 +1,42 @@
+{
+    "model_type": "audio_mamba2",
+    
+    "num_hidden_layers": 3,
+    "hidden_size": 256,
+    
+    "num_heads": 8,
+    "head_dim": 32,
+    "state_size": 128,
+    "expand": 2,
+    "n_groups": 1,
+    "conv_kernel": 4,
+    "chunk_size": 256,
+    
+    "hidden_act": "silu",
+    "rms_norm": true,
+    "norm_epsilon": 1e-5,
+    "residual_in_fp32": true,
+    
+    "time_step_rank": 32,  
+    "time_step_limit": [0.001, 100.0],
+    "time_step_min": 0.001,
+    "time_step_max": 0.1,
+    "time_step_floor": 1e-4,
+    
+    "use_bias": false,
+    "use_conv_bias": true,
+    
+    "n_mels": 80,
+    "n_fft": 2048,
+    "hop_length": 512,
+    "max_audio_length": 30.0,
+    "sample_rate": 16000,
+    
+    "loss_type": "mse",
+    "initializer_range": 0.02,
+    
+    "rescale_prenorm_residual": false,
+    "fuse_norm": false,
+    "fuse_cross_entropy": false,
+    "use_cache": false
+}
