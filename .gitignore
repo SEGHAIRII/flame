@@ -2,11 +2,14 @@
 test.py
 
 # data files
-data
+data/
 
 # bash scripts
 *.sh
 
+
+#torch titan save files
+torchtitan/
 # docs
 docs/_build
 
