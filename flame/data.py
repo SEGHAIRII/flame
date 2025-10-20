@@ -70,8 +70,8 @@ class DataCollatorForAudioDenoising:
         ])  # Shape: [batch_size, freq_bins, time_frames]
         
         return {
-            'clean_specto': clean_spectos.transpose(1, 2).contiguous(),
-            'noisy_specto': noisy_spectos.transpose(1, 2).contiguous()
+            'labels': clean_spectos.transpose(1, 2).contiguous(),
+            'input_ids': noisy_spectos.transpose(1, 2).contiguous()
         }
 
 class BufferShuffledIterableDataset(IterableDataset):

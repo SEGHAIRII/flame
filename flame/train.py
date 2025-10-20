@@ -393,9 +393,7 @@ def main(job_config: JobConfig):
 
     checkpoint.load(step=job_config.checkpoint.load_step)
     metric_logger = build_metrics_processor(job_config, parallel_dims)
-    # Set dependent attributes for metric_logger
-    if job_config.job.task == "text":
-        metric_logger.num_flops_per_token = num_flops_per_token
+    metric_logger.num_flops_per_token = num_flops_per_token
     metric_logger.optimizers = optimizers  # Pass optimizers if needed by logger logic
     metric_logger.lr_schedulers = (
         lr_schedulers  # Pass schedulers if needed by logger logic
@@ -481,10 +479,7 @@ def main(job_config: JobConfig):
                 # get batch
                 data_load_start = time.perf_counter()
                 batch = next(data_iterator)
-                if job_config.job.task == "text":
-                    input_ids, labels = batch["input_ids"], batch["labels"]
-                else:
-                    input_ids, labels = batch["noisy_specto"], batch["clean_specto"]
+                input_ids, labels = batch["input_ids"], batch["labels"]
 
                 # Update metrics processor state before forward/backward
                 metric_logger.ntokens_since_last_log += labels.numel()
@@ -513,6 +508,7 @@ def main(job_config: JobConfig):
                     else None
                 )
                 if cu_seqlens is not None:
+                    # skip for audio tasks for now
                     position_ids = prepare_position_ids(cu_seqlens).to(torch.int32)
                 else:
                     if job_config.job.task == "audio_denoising":
@@ -647,16 +643,17 @@ def main(job_config: JobConfig):
                     * (job_config.training.steps - train_state.step)
                     / train_state.step
                 )
-                # metric_logger.log(
-                #     train_state.step,
-                #     global_avg_loss,
-                #     global_max_loss,
-                #     extra_metrics={
-                #         "optimizer/lr": last_lr,
-                #         "optimizer/grad_norm": grad_norm.item(),
-                #         "optimizer/skipped_step": train_state.skipped_step,
-                #     },
-                # )
+                
+                metric_logger.log(
+                    train_state.step,
+                    global_avg_loss,
+                    global_max_loss,
+                    extra_metrics={
+                        "optimizer/lr": last_lr,
+                        "optimizer/grad_norm": grad_norm.item(),
+                        "optimizer/skipped_step": train_state.skipped_step,
+                    },
+                )
 
                 logger.info(
                     f"{color.blue}lr: {last_lr:.4e} gnorm: {grad_norm:5.2f} "
