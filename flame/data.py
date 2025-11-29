@@ -12,7 +12,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Union
 import datasets
 import numpy as np
 import torch
-from datasets import Dataset, IterableDataset, interleave_datasets, load_dataset
+from datasets import Dataset, IterableDataset, interleave_datasets, load_dataset, DatasetDict
 from datasets.iterable_dataset import ShufflingConfig
 from torch.distributed.checkpoint.stateful import Stateful
 from torchdata.stateful_dataloader import StatefulDataLoader
@@ -31,48 +31,6 @@ from build.lib.flame import data
 
 
 
-@dataclass
-class DataCollatorForAudioDenoising:
-    """
-    Data collator for audio denoising tasks.
-    Stacks clean and noisy spectrograms into batched tensors.
-    
-    Args:
-        None required, but you can add optional parameters for padding/normalization
-    
-    Returns:
-        A dictionary with:
-        - `noisy_specto`: Batched noisy spectrograms [batch_size, freq_bins, time_frames]
-        - `clean_specto`: Batched clean spectrograms [batch_size, freq_bins, time_frames]
-    """
-    
-    def __call__(self, batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
-        """
-        Collate a batch of spectrogram pairs.
-        
-        Args:
-            batch: List of dicts, each containing:
-                {'clean_specto': Tensor[freq, time], 'noisy_specto': Tensor[freq, time]}
-        
-        Returns:
-            Batched dict:
-                {'clean_specto': Tensor[batch, freq, time], 
-                 'noisy_specto': Tensor[batch, freq, time]}
-        """
-        # Stack clean spectrograms along batch dimension
-        clean_spectos = torch.stack([
-            sample['clean_specto'] for sample in batch
-        ])  # Shape: [batch_size, freq_bins, time_frames]
-        
-        # Stack noisy spectrograms along batch dimension
-        noisy_spectos = torch.stack([
-            sample['noisy_specto'] for sample in batch
-        ])  # Shape: [batch_size, freq_bins, time_frames]
-        
-        return {
-            'labels': clean_spectos.transpose(1, 2).contiguous(),
-            'input_ids': noisy_spectos.transpose(1, 2).contiguous()
-        }
 
 class BufferShuffledIterableDataset(IterableDataset):
     def __init__(
@@ -263,146 +221,6 @@ class OnlineTokenizedIterableDataset(IterableDataset):
         self.tokens = deepcopy(state_dict['tokens'])
 
 
-class OnlineAudioIterableDataset(IterableDataset):
-    def __init__(
-        self,
-        dataset: Dataset, 
-        n_fft: int,
-        hop_length: int,
-        n_mels: int = 80,
-        sample_rate: int = 16000,
-        rank: int = 0,
-        world_size: int = 1
-    ):
-        self.dataset = dataset
-        self.n_fft = n_fft
-        self.hop_length = hop_length
-        self.n_mels = n_mels
-        self.sample_rate = sample_rate
-        self.rank = rank
-        self.world_size = world_size
-        
-        # Shard the dataset across workers
-        self.data = dataset.shard(world_size, rank)
-        
-        # Create mel transform
-        self.mel_transform = T.MelSpectrogram(
-            sample_rate=sample_rate,
-            n_fft=n_fft,
-            hop_length=hop_length,
-            n_mels=n_mels,
-            center=True,
-        )
-        
-        # State tracking
-        self.states = None
-        
-        logger.info(f"[Rank {rank}] Initialized audio dataset")
-    
-    def __iter__(self):
-        """Iterate over dataset and create spectrograms."""
-        if self.states is not None:
-            self.data.load_state_dict(self.states)
-        
-        while True:
-            for sample in self.process_audio(self.data):
-                yield sample
-    
-    def process_audio(self, data, buffer_size: int = 64):
-        
-        import soundfile as sf
-        from pathlib import Path
-        
-        
-                
-        base_path = Path('data/audio_denoise')
-        clean_buffer = []
-        noisy_buffer = []
-        states = []
-        
-        for sample in data:
-            try:
-                # Load audio from file paths using torchaudio
-                clean_path = sample['clean_path']
-                noisy_path = sample['noisy_path']
-
-
-
-                clean_audio, sr_clean = sf.read(base_path / clean_path, dtype='float32')
-                noisy_audio, sr_noisy = sf.read(base_path / noisy_path, dtype='float32')
-                
-                clean_audio = torch.from_numpy(clean_audio)
-                noisy_audio = torch.from_numpy(noisy_audio)
-                
-                clean_audio = clean_audio.squeeze(0)
-                noisy_audio = noisy_audio.squeeze(0)
-                
-                
-                clean_buffer.append(clean_audio)
-                noisy_buffer.append(noisy_audio)
-                states.append(self.data.state_dict())
-                
-                # Process batch when buffer is full
-                if len(clean_buffer) == buffer_size:
-                    spectrograms = self._batch_create_spectrogram(
-                        clean_buffer,
-                        noisy_buffer
-                    )
-                    
-                    for s, spec_pair in zip(states, spectrograms):
-                        self.states = s
-                        yield spec_pair
-                    
-                    clean_buffer, noisy_buffer, states = [], [], []
-                    
-            except Exception as e:
-                logger.error(
-                    f"Error processing audio sample: {type(e).__name__}: {e}\n"
-                    f"Clean path: {sample.get('clean_path', 'N/A')}\n"
-                    f"Noisy path: {sample.get('noisy_path', 'N/A')}"
-                )
-                continue
-        
-        # Process remaining samples
-        if len(clean_buffer) > 0:
-            spectrograms = self._batch_create_spectrogram(
-                clean_buffer,
-                noisy_buffer
-            )
-            
-            for s, spec_pair in zip(states, spectrograms):
-                self.states = s
-                yield spec_pair
-    
-    def _batch_create_spectrogram(self, clean_audios, noisy_audios):
-        """Create mel spectrograms from audio batches."""
-        results = []
-        
-        for clean, noisy in zip(clean_audios, noisy_audios):
-            # Already tensors from torchaudio.load
-            # Compute mel spectrograms
-            clean_mel = self.mel_transform(clean)
-            noisy_mel = self.mel_transform(noisy)
-            
-            # Apply log scale
-            clean_mel = torch.log(clean_mel + 1e-9)
-            noisy_mel = torch.log(noisy_mel + 1e-9)
-            
-            results.append({
-                'clean_specto': clean_mel,
-                'noisy_specto': noisy_mel,
-            })
-        
-        return results
-    
-    def state_dict(self):
-        """Return the current state for checkpointing."""
-        return {'states': self.states}
-    
-    def load_state_dict(self, state_dict):
-        """Load state from checkpoint."""
-        self.states = state_dict['states']
-
 
 
 class BufferShuffledExamplesIterable(datasets.iterable_dataset.BufferShuffledExamplesIterable):
@@ -501,6 +319,7 @@ def shuffle(
         distributed=copy.deepcopy(dataset._distributed),
         token_per_repo_id=dataset._token_per_repo_id,
     )
+
 
 
 @dataclass
@@ -740,7 +559,6 @@ class ParallelAwareDataLoader(StatefulDataLoader, Stateful):
 
 #keep the same
 def build_dataset(
-    task:Literal['text', 'audio_denoising'],
     dataset: str = None,
     dataset_name: str = None,
     dataset_split: str = 'train',
@@ -755,23 +573,19 @@ def build_dataset(
     color = utils.Color
     min_num_shards = dp_degree * num_workers if dp_degree else None
     if len(dataset.split(',')) == 1:
-        if task == 'text':
-            dataset = load_dataset(
-                path=dataset,
-                name=dataset_name,
-                split=dataset_split,
-                data_dir=data_dir,
-                data_files=data_files,
-                trust_remote_code=True,
-                streaming=streaming,
-                num_proc=num_workers if not streaming else None,
-            )
-        else:
-            with open(data_files, 'r') as f:
-                data = json.load(f)
-            dataset = Dataset.from_list(data)
-            
-            
+        dataset = load_dataset(
+            path=dataset,
+            name=dataset_name,
+            split=dataset_split,
+            data_dir=data_dir,
+            data_files=data_files,
+            trust_remote_code=True,
+            streaming=streaming,
+            num_proc=num_workers if not streaming else None,
+        )
+        if type(dataset) is DatasetDict:
+            print('forjfioerjgoejgroejg')
+            dataset = dataset[dataset_split]
         logger.info(f"Shuffling the dataset with seed {seed}")
         if not streaming:
             # the states of map-style dataset is recoverable after shuffling
@@ -936,20 +750,21 @@ def build_dataset(
 
 
 #modify this one
-def build_dataloader_text(
+def build_dataloader_causal(
     dataset: IterableDataset,
     tokenizer: PreTrainedTokenizer,
     rank: int,
-    world_size: int,
     batch_size: int,
     seq_len: int,
+    world_size: int = 1,
     context_len: Optional[int] = None,
     varlen: bool = False,
     num_workers: int = 0,
     pin_memory: bool = False,
     persistent_workers: bool = False,
     snapshot_every_n_steps: Optional[int] = 1,
-):
+    **kwargs
+)-> ParallelAwareDataLoader:
     
     
     dataset = OnlineTokenizedIterableDataset(
@@ -966,74 +781,3 @@ def build_dataloader_text(
         snapshot_every_n_steps=snapshot_every_n_steps,
     )
 
-
-def build_dataloader_audio(
-    dataset:IterableDataset, 
-    split: str = 'train',
-    n_fft: int = 2048,
-    hop_length: int = 512,
-    n_mels: int = 80,
-    sample_rate: int = 16000,
-    max_audio_length: float = 30.0,
-    rank: int = 0,
-    world_size: int = 1,
-    batch_size: int = 4,
-    num_workers: int = 0,
-    pin_memory: bool = False,
-    persistent_workers: bool = False,
-    snapshot_every_n_steps: Optional[int] = 1,
-) -> ParallelAwareDataLoader:
-    """
-    Build audio dataloader using load_dataset.
-    """
-    # from datasets import load_dataset
-    # from pathlib import Path
-    
-    # dataset_dir = Path(dataset_path)
-    
-    
-    # loading_script = 'flame/custom_datasets/AudioDenoisingDataset.py'
-    
-    
-    # Load dataset using HuggingFace load_dataset
-    # dataset = load_dataset(
-        # str(loading_script),     
-        # data_dir=dataset_path,   
-        # split=split,             
-        # streaming=True,         
-        # trust_remote_code=True,  
-    # )
-
-
-    logger.info('==================================================================================================================')
-    logger.info(f"Audio dataset columns: {dataset.column_names}")
-    dataset = OnlineAudioIterableDataset(
-        dataset=dataset,
-        n_fft=n_fft,
-        hop_length=hop_length,
-        n_mels=n_mels,
-        sample_rate=sample_rate,
-        rank=rank,
-        world_size=world_size,
-    )
-    
-    return ParallelAwareDataLoader(
-        rank=rank,
-        dataset=dataset,
-        batch_size=batch_size,
-        collate_fn=DataCollatorForAudioDenoising(),
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        persistent_workers=persistent_workers,
-        snapshot_every_n_steps=snapshot_every_n_steps,
-    )
-
-    
-def build_dataloader(task: Literal['audio_denoising', 'text'], *args, **kwargs):
-    if task == 'audio_denoising':
-        return build_dataloader_audio(*args, **kwargs)
-    elif task == 'text':
-        return build_dataloader_text(*args, **kwargs)
-    else:
-        raise ValueError(f"Unsupported task: {task}. Supported tasks are 'audio_denoising' and 'text'.")
-    

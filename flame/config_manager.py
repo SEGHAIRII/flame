@@ -278,6 +278,15 @@ class JobConfig:
             "--training.seq_len", type=int, default=2048, help="Sequence length"
         )
         self.parser.add_argument(
+            "--training.target_sparsity", type=float, default=0.9, help="Target sparsity for pruning"
+        )
+        self.parser.add_argument(
+            "--training.enable_weight_sparsification", type=bool, default=False, help="Enable weight sparsification during training"
+        )
+        self.parser.add_argument(
+            "--training.update_sparsity_steps", type=int, default=100, help="Steps interval for updating sparsity during pruning"
+        )
+        self.parser.add_argument(
             "--training.context_len",
             type=int,
             default=2048,

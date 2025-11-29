@@ -11,10 +11,14 @@ from datetime import timedelta
 from pathlib import Path
 import sys
 
+# to import custom_models from sparse_mamba
+sparse_mamba_path = Path(__file__).parent.parent.parent
+
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
+sys.path.append(str(sparse_mamba_path))
 
-import fla  # noqa
+import fla
 import torch
 from fla.modules.fused_linear_cross_entropy import FusedLinearCrossEntropyLoss
 from fla.ops.utils import prepare_position_ids
@@ -34,20 +38,320 @@ from torchtitan.tools.logging import init_logger, logger
 from torchtitan.tools.profiling import maybe_enable_memory_snapshot, maybe_enable_profiling
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, AutoModel, AutoConfig
 
-import custom_models
+
+from sparse_mamba import custom_models
 from flame.components.checkpoint import TrainState
 from flame.config_manager import JobConfig
-from flame.data import build_dataloader, build_dataset
+from flame.data import build_dataloader_causal, build_dataset
 from flame.models.parallelize_fla import parallelize_fla
 from flame.models.pipeline_fla import pipeline_fla
 from flame.tools.utils import get_nparams_and_flops
 
+def erk_sparsity_distribution(model_parts, current_sparsity):
+    """
+    Compute ERK (Erdős-Rényi-Kernel) sparsity distribution.
+    
+    Formula: s_l = s * (N_l * M_l) / (N_l + M_l)
+    
+    This gives higher sparsity to layers with more parameters.
+    """
+    erk_sparsities = {}
+    raw_probabilities = {}
+    
+    # Step 1: Calculate raw ERK probabilities for each layer
+    for model in model_parts:
+        for name, param in model.named_parameters():
+            if param.requires_grad and len(param.shape) >= 2:
+                if len(param.shape) == 2:
+                    N, M = param.shape
+                elif len(param.shape) > 2:
+                    N = param.shape[0]
+                    M = param.numel() // N
+                else:
+                    continue
+                
+                # ERK formula: higher values for larger layers
+                # This is (N * M) / (N + M), the "kernel" term
+                raw_probabilities[name] = (N * M) / (N + M)
+    
+    # Step 2: Normalize to achieve target overall sparsity
+    if not raw_probabilities:
+        return erk_sparsities
+    
+    # Calculate normalization factor
+    # We want: sum(s_l * num_params_l) / sum(num_params_l) = current_sparsity
+    total_params = 0
+    weighted_sum = 0
+    
+    for model in model_parts:
+        for name, param in model.named_parameters():
+            if name in raw_probabilities:
+                num_params = param.numel()
+                total_params += num_params
+                weighted_sum += raw_probabilities[name] * num_params
+    
+    # Normalization factor to achieve target sparsity
+    epsilon = 1e-10
+    erk_power_scale = current_sparsity * total_params / (weighted_sum + epsilon)
+    
+    # Step 3: Compute final layer sparsities
+    for name, raw_prob in raw_probabilities.items():
+        layer_sparsity = erk_power_scale * raw_prob
+        # Clamp to valid range [0, 1]
+        layer_sparsity = min(max(layer_sparsity, 0.0), 0.99)  # Avoid 100% sparsity
+        erk_sparsities[name] = layer_sparsity
+    
+    logger.info(f"ERK Sparsities (target={current_sparsity:.4f}): {erk_sparsities}")
+    
+    return erk_sparsities
+
+
+def apply_magnitude_pruning(model_parts, erk_sparsities=None):
+    """
+    Apply magnitude pruning to model parameters.
+    Uses ERK strategy if erk_sparsities provided, otherwise uniform sparsity.
+    
+    Args:
+        model_parts: List of model parts
+        target_sparsity: Overall target sparsity (0-1)
+        erk_sparsities: Dict of per-layer sparsities (optional)
+    
+    Returns:
+        dict: Pruning masks for each parameter
+    """
+    masks = {}
+    
+    for model in model_parts:
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            
+            # Determine layer sparsity
+            if erk_sparsities and name in erk_sparsities:
+                layer_sparsity = erk_sparsities[name]
+            
+            # Skip if no pruning needed
+            if layer_sparsity <= 0:
+                masks[name] = torch.ones_like(param, dtype=torch.bool)
+                continue
+            
+            # Calculate threshold for this layer
+            param_abs = param.data.abs()
+            num_params = param_abs.numel()
+            num_to_prune = int(layer_sparsity * num_params)
+            
+            if num_to_prune >= num_params:
+                # Prune everything
+                masks[name] = torch.zeros_like(param, dtype=torch.bool)
+            elif num_to_prune > 0:
+                # TopK to find threshold
+                threshold = torch.topk(
+                    param_abs.flatten(), 
+                    num_params - num_to_prune,
+                    largest=True
+                ).values[-1]
+                
+                # Create mask: 1 where |weight| >= threshold
+                masks[name] = param_abs >= threshold
+            else:
+                # No pruning
+                masks[name] = torch.ones_like(param, dtype=torch.bool)
+    
+    return masks
+
+def apply_masks_to_weights(model_parts, masks):
+    """
+    Apply masks to weights in forward pass.
+    This zeros out pruned weights before forward computation.
+    """
+    
+    if masks is None:
+        return
+    for model in model_parts:
+        for name, param in model.named_parameters():
+            if name in masks:
+                # Zero out pruned weights (forward pass masking)
+                param.data.mul_(masks[name].to(param.device))
+
+
+def sparsity_schedule(current_step, target_sparsity, total_steps):
+    """
+    Calculate sparsity at current step using cubic polynomial schedule.
+    
+    S_t = S_f - (S_f - S_i) * (1 - t/t_f)^3
+    where S_i = 0, t_i = 0, t_f = 0.75 * T
+    
+    Args:
+        current_step: Current training step
+        target_sparsity: Final target sparsity S_f (0-1)
+        total_steps: Total training steps T
+    
+    Returns:
+        float: Current sparsity (0-1)
+    """
+    if current_step >= total_steps:
+        return target_sparsity
+    
+    t_f = 0.75 * total_steps
+    
+    if current_step >= t_f:
+        return target_sparsity
+    
+    # Cubic schedule: S_t = S_f - S_f * (1 - t/t_f)^3
+    progress = current_step / t_f
+    sparsity = target_sparsity * (1 - (1 - progress) ** 3)
+    
+    return sparsity
+
+
+
+def calculate_sparsity(model_parts, threshold=1e-5):
+    """
+    Calculate sparsity metrics for model parameters.
+    
+    Args:
+        model_parts: List of model parts (or single model)
+        threshold: Values below this threshold are considered zero
+    
+    Returns:
+        dict with sparsity metrics
+    """
+    
+    total_params = 0
+    zero_params = 0
+    layer_sparsity = {}
+    
+    for model in model_parts:
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                param_data = param.detach()
+                num_params = param_data.numel()
+                num_zeros = (param_data.abs() < threshold).sum().item()
+                
+                total_params += num_params
+                zero_params += num_zeros
+                
+                # Track per-layer sparsity
+                layer_name = name.split('.')[0]  # Get top-level layer name
+                if layer_name not in layer_sparsity:
+                    layer_sparsity[layer_name] = {'total': 0, 'zeros': 0}
+                layer_sparsity[layer_name]['total'] += num_params
+                layer_sparsity[layer_name]['zeros'] += num_zeros
+    
+    overall_sparsity = (zero_params / total_params * 100) if total_params > 0 else 0
+    
+    # Calculate per-layer sparsity percentages
+    layer_sparsity_pct = {
+        layer: (stats['zeros'] / stats['total'] * 100) if stats['total'] > 0 else 0
+        for layer, stats in layer_sparsity.items()
+    }
+    
+    return {
+        'overall_sparsity': overall_sparsity,
+        'total_params': total_params,
+        'zero_params': zero_params,
+        'layer_sparsity': layer_sparsity_pct
+    }
+
+class ActivationSparsityTracker:
+    """Track activation sparsity during forward pass."""
+    
+    def __init__(self, threshold=1e-6):
+        self.threshold = threshold
+        self.activations = {}
+        self.hooks = []
+        
+    def register_hooks(self, model):
+        """Register forward hooks to capture activations after ReLU."""
+        
+        def hook_fn(name):
+            def hook(module, input, output):
+                # Handle different output types
+                if isinstance(output, torch.Tensor):
+                    act = output
+                elif isinstance(output, tuple) and len(output) > 0:
+                    act = output[0]  # Take first element if tuple
+                else:
+                    return
+                
+                # Store activation sparsity info
+                if act is not None and torch.is_tensor(act):
+                    with torch.no_grad():
+                        total = act.numel()
+                        zeros = (act.abs() < self.threshold).sum().item()
+                        self.activations[name] = {
+                            'total': total,
+                            'zeros': zeros,
+                            'sparsity': (zeros / total * 100) if total > 0 else 0
+                        }
+            return hook
+        
+        # Register hooks specifically for ReLU layers after norm
+        if hasattr(model, 'backbone') and hasattr(model.backbone, 'layers'):
+            for layer_idx, layer in enumerate(model.backbone.layers):
+                if hasattr(layer, 'relu'):
+                    # Hook the ReLU layer directly
+                    name = f"layer_{layer_idx}.relu"
+                    handle = layer.relu.register_forward_hook(hook_fn(name))
+                    self.hooks.append(handle)
+        else:
+            # Fallback: iterate through named_modules to find ReLU layers
+            for name, module in model.named_modules():
+                # Only hook ReLU layers in Mamba2Block that come after norm
+                if 'layers' in name and '.relu' in name and isinstance(module, torch.nn.ReLU):
+                    handle = module.register_forward_hook(hook_fn(name))
+                    self.hooks.append(handle)
+    
+    def get_statistics(self):
+        """Compute aggregated activation sparsity statistics."""
+        if not self.activations:
+            return {
+                'overall_sparsity': 0.0,
+                'total_activations': 0,
+                'zero_activations': 0,
+                'layer_sparsity': {}
+            }
+        
+        total_acts = sum(v['total'] for v in self.activations.values())
+        zero_acts = sum(v['zeros'] for v in self.activations.values())
+        overall_sparsity = (zero_acts / total_acts * 100) if total_acts > 0 else 0
+        
+        layer_sparsity = {
+            name: info['sparsity'] 
+            for name, info in self.activations.items()
+        }
+        
+        return {
+            'overall_sparsity': overall_sparsity,
+            'total_activations': total_acts,
+            'zero_activations': zero_acts,
+            'layer_sparsity': layer_sparsity
+        }
+    
+    def reset(self):
+        """Clear stored activations."""
+        self.activations.clear()
+    
+    def remove_hooks(self):
+        """Remove all registered hooks."""
+        for handle in self.hooks:
+            handle.remove()
+        self.hooks.clear()
 
 def build_tokenizer(job_config: JobConfig) -> AutoTokenizer:
     return AutoTokenizer.from_pretrained(job_config.model.tokenizer_path)
 
 # to do : see the loss function
 # modify the flops per token calculation...
+
+# def relufication_step_2(model:torch.nn.Module):
+    for layer in model.backbone.layers:
+        # Wrap norm and add ReLU
+        original_norm = layer.norm
+        layer.norm = torch.nn.Sequential(
+            original_norm,
+            torch.nn.ReLU()
+        )
 
 
 # Register all causal lm models
@@ -60,7 +364,7 @@ register_train_spec(
         pipelining_fn=pipeline_fla,
         build_optimizers_fn=build_optimizers,
         build_lr_schedulers_fn=build_lr_schedulers,
-        build_dataloader_fn=build_dataloader,
+        build_dataloader_fn=build_dataloader_causal,
         build_tokenizer_fn=build_tokenizer,
         build_loss_fn=build_cross_entropy_loss,
     )
@@ -68,20 +372,6 @@ register_train_spec(
 
 # Register all audio denoising models
 
-register_train_spec(
-    TrainSpec(
-        name="audio_denoising_fla",
-        cls=AutoModel,
-        config=AutoConfig,
-        parallelize_fn=parallelize_fla,
-        pipelining_fn=pipeline_fla,
-        build_optimizers_fn=build_optimizers,
-        build_lr_schedulers_fn=build_lr_schedulers,
-        build_dataloader_fn=build_dataloader,
-        build_tokenizer_fn=None,
-        build_loss_fn=None,
-    )
-)
 
 # Enable debug tracing on failure: https://pytorch.org/docs/stable/elastic/errors.html
 
@@ -168,31 +458,32 @@ def main(job_config: JobConfig):
     )
     train_spec = get_train_spec(job_config.model.name)
 
-    logger.info("Loading tokenizer...")
-    if job_config.job.task == "text":
+
+
+    tokenizer = None
+
+    # change this
+    if train_spec.build_tokenizer_fn is not None:
+        logger.info("Loading tokenizer...")
         tokenizer = AutoTokenizer.from_pretrained(
             job_config.model.tokenizer_path,
             trust_remote_code=True,
             model_max_length=int(1e10),
         )
         logger.info(f"{tokenizer}")
-        logger.info(
+        
+        
+    logger.info(
         f"Loading dataset {job_config.training.dataset}"
         f":{job_config.training.dataset_name}"
         if job_config.training.dataset_name is not None
         else ""
     )
-    else:
-        logger.info('''Audio denoising task does not require tokenizer.
-                      skipping this part/''')
-        tokenizer = None
-        
-        
+    # change this 
     dataset = build_dataset(
-        task= job_config.job.task,
         dataset=job_config.training.dataset,
         dataset_name=job_config.training.dataset_name,
-        dataset_split=job_config.training.dataset_split,
+        dataset_split=job_config.training.dataset_split if job_config.training.dataset_split is not None else 'train',
         data_dir=job_config.training.data_dir,
         data_files=job_config.training.data_files,
         data_probs=job_config.training.data_probs,
@@ -201,49 +492,27 @@ def main(job_config: JobConfig):
         num_workers=job_config.training.num_workers,
         seed=job_config.training.seed,
     )
-        
+            
 
     logger.info("Building dataloader...")
+      
+    train_args = job_config.to_dict()['training']
+    train_args.pop('dataset')
     
-    
-    if job_config.job.task == "text":
-        dataloader_args = {
-            "task": job_config.job.task,
+    dataloader_args = {
             "dataset": dataset,
             "tokenizer": tokenizer,
             "rank": dp_rank,
-            "world_size": dp_degree,
-            "batch_size": job_config.training.batch_size,
-            "seq_len": job_config.training.seq_len,
-            "context_len": job_config.training.context_len,
-            "varlen": job_config.training.varlen,
-            "num_workers": job_config.training.num_workers,
-            "pin_memory": job_config.training.pin_memory,
-            "persistent_workers": job_config.training.persistent_workers,
-            "snapshot_every_n_steps": job_config.checkpoint.interval,
-        }
+        } | train_args
         
-    else:
-        dataloader_args = {
-            "task": job_config.job.task,
-            "dataset":dataset,
-            "n_fft": job_config.training.n_fft,
-            "hop_length": job_config.training.hop_length,
-            "n_mels": job_config.training.n_mels,
-            "sample_rate": job_config.training.sample_rate, 
-            "rank": dp_rank,
-            "world_size": dp_degree,
-            "batch_size": job_config.training.batch_size,
-            "num_workers": job_config.training.num_workers,
-            "pin_memory": job_config.training.pin_memory,
-            "persistent_workers": job_config.training.persistent_workers,
-            "snapshot_every_n_steps": job_config.checkpoint.interval,
-        }
 
-    dataloader = build_dataloader(**dataloader_args)
+    
+    # change this
+    dataloader = train_spec.build_dataloader_fn(**dataloader_args)
 
     logger.info(f"Loading model config from {job_config.model.config}")
-    model_config = AutoConfig.from_pretrained(job_config.model.config)
+    
+    model_config = train_spec.config.from_pretrained(job_config.model.config)
     # set the model configs from training inputs:
     # 1. norm type to decide which norm layer to use
     # 2. disable fused norm if TP is enabled
@@ -273,14 +542,16 @@ def main(job_config: JobConfig):
     logger.info(
         f"Building model from the config\n{color.green}{model_config}{color.reset}"
     )
+    
+    
+    
+    # change this
     with torch.device("meta"):
-        if job_config.job.task == "text":
-            model = AutoModelForCausalLM.from_config(model_config)
-        else:
-            model = AutoModel.from_config(model_config)
+        model = train_spec.cls.from_config(model_config)
+        # relufication_step_2(model)
         if (
             getattr(model_config, "fuse_linear_cross_entropy", False)
-            and FusedLinearCrossEntropyLoss is not None
+            and FusedLinearCrossEntropyLoss is not None and job_config.job.task == "causal"
         ):
             model.criterion = FusedLinearCrossEntropyLoss(
                 num_chunks=8 // parallel_dims.tp
@@ -294,7 +565,7 @@ def main(job_config: JobConfig):
     model_converters.convert(model)
 
     # calculate model size and flops per token
-    #skip for audio for now
+    # change this
     model_param_count, num_flops_per_token = get_nparams_and_flops(
         model, model_config, job_config.training.context_len
     )
@@ -350,6 +621,10 @@ def main(job_config: JobConfig):
 
         model_parts = [model]
 
+    
+    activation_tracker = ActivationSparsityTracker(threshold=1e-6)
+    for model in model_parts:
+        activation_tracker.register_hooks(model)
     device_mem_stats = device_memory_monitor.get_peak_stats()
     logger.info(
         f"{device_type.upper()} memory usage for model: "
@@ -430,6 +705,8 @@ def main(job_config: JobConfig):
         * dp_degree
         * job_config.training.gradient_accumulation_steps
     )
+    
+    # change this
     num_tokens_per_step = global_batch_size * job_config.training.seq_len
     # train loop
     logger.info(f"{color.red}***** Running training *****{color.reset}")
@@ -458,7 +735,18 @@ def main(job_config: JobConfig):
     logger.info(
         f"{color.green}  Number of parameters = {model_param_count:,} {color.reset}"
     )
-
+    
+    
+    
+    
+    
+    update_sparsity_every_n_steps = job_config.training.update_sparsity_steps
+    current_sparsity = 0.0
+    target_sparsity = job_config.training.target_sparsity  
+    pruning_masks = None
+    erk_sparsities = None
+    enable_weight_sparsification = job_config.training.enable_weight_sparsification
+    
     with (
         maybe_enable_profiling(
             job_config, global_step=train_state.step
@@ -469,6 +757,28 @@ def main(job_config: JobConfig):
     ):
         while train_state.step < job_config.training.steps:
             train_state.step += 1
+            if enable_weight_sparsification:
+                if  train_state.step % update_sparsity_every_n_steps == 0:
+                    current_sparsity = sparsity_schedule(
+                        train_state.step, 
+                        target_sparsity, 
+                        job_config.training.steps
+                    )
+                    erk_sparsities = erk_sparsity_distribution(model_parts, current_sparsity)
+                    pruning_masks = apply_magnitude_pruning(
+                        model_parts, 
+                        erk_sparsities
+                    )
+                    
+                    logger.info(
+                        f"{color.magenta}Updated pruning masks: "
+                        f"target_sparsity={current_sparsity:.4f} at step {train_state.step}{color.reset}"
+                    )
+                    
+                apply_masks_to_weights(model_parts, pruning_masks)  
+            
+                
+            
             gc_handler.run(train_state.step)
 
             optimizers.zero_grad()
@@ -479,6 +789,7 @@ def main(job_config: JobConfig):
                 # get batch
                 data_load_start = time.perf_counter()
                 batch = next(data_iterator)
+                #change this
                 input_ids, labels = batch["input_ids"], batch["labels"]
 
                 # Update metrics processor state before forward/backward
@@ -502,20 +813,16 @@ def main(job_config: JobConfig):
 
                 """
                 labels = labels.to(device_type)
+                # change this
                 cu_seqlens = (
                     batch["cu_seqlens"].to(device_type)
                     if "cu_seqlens" in batch
                     else None
                 )
                 if cu_seqlens is not None:
-                    # skip for audio tasks for now
                     position_ids = prepare_position_ids(cu_seqlens).to(torch.int32)
                 else:
-                    if job_config.job.task == "audio_denoising":
-                        # for audio denoising, we do not use position_ids
-                        position_ids = None
-                    else:
-                        position_ids = (
+                    position_ids = (
                             torch.arange(0, input_ids.shape[1], device=device_type)
                             .repeat(input_ids.shape[0], 1)
                             .to(torch.int32)
@@ -621,6 +928,24 @@ def main(job_config: JobConfig):
                     # Scale back the loss before logging
                     global_avg_loss = global_max_loss = loss.item()
 
+               
+                sparsity_metrics = calculate_sparsity(model_parts)
+                activation_sparsity = activation_tracker.get_statistics()
+                if parallel_dims.dp_enabled:
+                    # Convert to tensors for all_reduce
+                    total_acts = torch.tensor(activation_sparsity['total_activations'], device=device)
+                    zero_acts = torch.tensor(activation_sparsity['zero_activations'], device=device)
+                    
+                    torch.distributed.all_reduce(total_acts, group=world_mesh["dp"].get_group())
+                    torch.distributed.all_reduce(zero_acts, group=world_mesh["dp"].get_group())
+                    
+                    activation_sparsity['total_activations'] = total_acts.item()
+                    activation_sparsity['zero_activations'] = zero_acts.item()
+                    activation_sparsity['overall_sparsity'] = (
+                        zero_acts / total_acts * 100 if total_acts > 0 else 0
+                    ).item()
+                
+                activation_tracker.reset()   
                 # Update train state tokens and elapsed time
                 time_now = time.perf_counter()
                 time_delta = (
@@ -644,19 +969,43 @@ def main(job_config: JobConfig):
                     / train_state.step
                 )
                 
+                extra_metrics = {
+                    "optimizer/lr": last_lr,
+                    "optimizer/grad_norm": grad_norm.item(),
+                    "optimizer/skipped_step": train_state.skipped_step,
+                    "sparsity/weights_overall": sparsity_metrics['overall_sparsity'],
+                    "sparsity/weights_zero_params": sparsity_metrics['zero_params'],
+                    "sparsity/activations_overall": activation_sparsity['overall_sparsity'],
+                    "sparsity/activations_zero": activation_sparsity['zero_activations'],
+                }
+                for layer_name, sparsity_pct in sparsity_metrics['layer_sparsity'].items():
+                    extra_metrics[f"sparsity/layer_{layer_name}"] = sparsity_pct
+                
+                
+                # Add per-layer activation sparsity (top 5 most sparse)
+                sorted_act_sparsity = sorted(
+                    activation_sparsity['layer_sparsity'].items(),
+                    key=lambda x: x[1],
+                    reverse=True
+                )[:5]  # Only log top 5 to avoid cluttering
+                for layer_name, sparsity_pct in sorted_act_sparsity:
+                    # Shorten layer names for cleaner logging
+                    short_name = layer_name.split('.')[-1]
+                    extra_metrics[f"sparsity/act_{short_name}"] = sparsity_pct
+                
+                
                 metric_logger.log(
                     train_state.step,
                     global_avg_loss,
                     global_max_loss,
-                    extra_metrics={
-                        "optimizer/lr": last_lr,
-                        "optimizer/grad_norm": grad_norm.item(),
-                        "optimizer/skipped_step": train_state.skipped_step,
-                    },
+                    extra_metrics=extra_metrics,
                 )
+                
 
                 logger.info(
                     f"{color.blue}lr: {last_lr:.4e} gnorm: {grad_norm:5.2f} "
+                    f"{color.cyan}weight_sp: {sparsity_metrics['overall_sparsity']:.2f}% "
+                    f"{color.yellow}act_sp: {activation_sparsity['overall_sparsity']:.2f}% "
                     f"{color.magenta}[{str(train_state.elapsed).split('.')[0]:>8}<{str(eta).split('.')[0]:>8}]{color.reset}"
                 )
 
@@ -681,6 +1030,9 @@ def main(job_config: JobConfig):
     if torch.distributed.get_rank() == 0:
         logger.info("Sleeping 2 seconds for other ranks to complete")
         time.sleep(2)
+    
+    activation_tracker.remove_hooks()
+
 
     metric_logger.close()
     logger.info("Training completed")

@@ -47,5 +47,7 @@ setup(
         'wandb',
         'tiktoken',
         'tensorboard',
+        'tyro',
+        'torchaudio'
     ],
 )
