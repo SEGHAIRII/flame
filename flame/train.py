@@ -12,13 +12,13 @@ from pathlib import Path
 import sys
 
 # to import custom_models from sparse_mamba
-sparse_mamba_path = Path(__file__).parent.parent.parent
+# sparse_mamba_path = Path(__file__).parent.parent.parent
 
-project_root = Path(__file__).parent.parent
-sys.path.insert(0, str(project_root))
-sys.path.append(str(sparse_mamba_path))
+# project_root = Path(__file__).parent.parent
+# sys.path.insert(0, str(project_root))
+# sys.path.append(str(sparse_mamba_path))
 
-import fla
+# import fla
 import torch
 from fla.modules.fused_linear_cross_entropy import FusedLinearCrossEntropyLoss
 from fla.ops.utils import prepare_position_ids
@@ -39,7 +39,8 @@ from torchtitan.tools.profiling import maybe_enable_memory_snapshot, maybe_enabl
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, AutoModel, AutoConfig
 
 
-from sparse_mamba import custom_models
+from sparse_mamba.custom_models import *
+from sparse_mamba.custom_dataloaders import * 
 from flame.components.checkpoint import TrainState
 from flame.config_manager import JobConfig
 from flame.data import build_dataloader_causal, build_dataset
@@ -253,6 +254,7 @@ def calculate_sparsity(model_parts, threshold=1e-5):
         'layer_sparsity': layer_sparsity_pct
     }
 
+    
 class ActivationSparsityTracker:
     """Track activation sparsity during forward pass."""
     
@@ -260,51 +262,72 @@ class ActivationSparsityTracker:
         self.threshold = threshold
         self.activations = {}
         self.hooks = []
-        
+    
     def register_hooks(self, model):
-        """Register forward hooks to capture activations after ReLU."""
         
-        def hook_fn(name):
-            def hook(module, input, output):
-                # Handle different output types
-                if isinstance(output, torch.Tensor):
-                    act = output
-                elif isinstance(output, tuple) and len(output) > 0:
-                    act = output[0]  # Take first element if tuple
-                else:
-                    return
+        logger.info(f"Registering hooks on FSDP model type: {type(model)}")
+        
+        # Don't unwrap - iterate directly on the FSDP-wrapped model
+        hook_count = 0
+        for name, module in model.named_modules():
+            # Look for out_proj Linear modules
+            if 'out_proj' in name and isinstance(module, torch.nn.Linear):
+                logger.info(f"Found out_proj: {name} (type: {type(module)})")
                 
-                # Store activation sparsity info
-                if act is not None and torch.is_tensor(act):
-                    with torch.no_grad():
-                        total = act.numel()
-                        zeros = (act.abs() < self.threshold).sum().item()
-                        self.activations[name] = {
-                            'total': total,
-                            'zeros': zeros,
-                            'sparsity': (zeros / total * 100) if total > 0 else 0
-                        }
-            return hook
+                # Use closure to capture the correct layer name
+                def make_hook(layer_name):
+                    def hook(mod, input, output):
+                        # Capture the INPUT to out_proj
+                        if isinstance(input, tuple) and len(input) > 0:
+                            act = input[0]
+                        elif torch.is_tensor(input):
+                            act = input
+                        else:
+                            return
+                        
+                        
+                        print(f"Activation input shape for {layer_name}: {act.shape}", flush=True)                        # Store activation sparsity info
+                        if act is not None and torch.is_tensor(act):
+                            with torch.no_grad():
+                                act_flat = act.flatten()
+                                total = act_flat.numel()
+                                zeros = (act_flat.abs() < self.threshold).sum().item()
+                                sparsity = (zeros / total * 100) if total > 0 else 0
+                                
+                                # Accumulate statistics (hooks fire multiple times per batch)
+                                if layer_name not in self.activations:
+                                    self.activations[layer_name] = {
+                                        'total': 0,
+                                        'zeros': 0,
+                                        'sparsity': 0
+                                    }
+                                
+                                self.activations[layer_name]['total'] += total
+                                self.activations[layer_name]['zeros'] += zeros
+                                # Recalculate sparsity percentage
+                                self.activations[layer_name]['sparsity'] = (
+                                    self.activations[layer_name]['zeros'] / 
+                                    self.activations[layer_name]['total'] * 100
+                                )
+                    return hook
+                
+                handle = module.register_forward_hook(make_hook(name))
+                self.hooks.append(handle)
+                hook_count += 1
+                logger.info(f"✓ Registered hook {hook_count}: {name}")
         
-        # Register hooks specifically for ReLU layers after norm
-        if hasattr(model, 'backbone') and hasattr(model.backbone, 'layers'):
-            for layer_idx, layer in enumerate(model.backbone.layers):
-                if hasattr(layer, 'relu'):
-                    # Hook the ReLU layer directly
-                    name = f"layer_{layer_idx}.relu"
-                    handle = layer.relu.register_forward_hook(hook_fn(name))
-                    self.hooks.append(handle)
-        else:
-            # Fallback: iterate through named_modules to find ReLU layers
-            for name, module in model.named_modules():
-                # Only hook ReLU layers in Mamba2Block that come after norm
-                if 'layers' in name and '.relu' in name and isinstance(module, torch.nn.ReLU):
-                    handle = module.register_forward_hook(hook_fn(name))
-                    self.hooks.append(handle)
+        logger.info(f"=== Total hooks registered: {hook_count} ===")
     
     def get_statistics(self):
-        """Compute aggregated activation sparsity statistics."""
+        """
+        Compute overall activation sparsity statistics.
+        
+        Returns:
+            dict: Contains 'overall_sparsity', 'total_activations', 'zero_activations', 
+                  and 'layer_sparsity' (per-layer sparsity percentages)
+        """
         if not self.activations:
+            logger.warning("No activations captured!")
             return {
                 'overall_sparsity': 0.0,
                 'total_activations': 0,
@@ -312,31 +335,36 @@ class ActivationSparsityTracker:
                 'layer_sparsity': {}
             }
         
-        total_acts = sum(v['total'] for v in self.activations.values())
-        zero_acts = sum(v['zeros'] for v in self.activations.values())
-        overall_sparsity = (zero_acts / total_acts * 100) if total_acts > 0 else 0
+        total_activations = sum(stats['total'] for stats in self.activations.values())
+        zero_activations = sum(stats['zeros'] for stats in self.activations.values())
         
+        overall_sparsity = (
+            (zero_activations / total_activations * 100) 
+            if total_activations > 0 else 0.0
+        )
+        
+        # Per-layer sparsity
         layer_sparsity = {
-            name: info['sparsity'] 
-            for name, info in self.activations.items()
+            name: stats['sparsity'] 
+            for name, stats in self.activations.items()
         }
         
         return {
             'overall_sparsity': overall_sparsity,
-            'total_activations': total_acts,
-            'zero_activations': zero_acts,
+            'total_activations': total_activations,
+            'zero_activations': zero_activations,
             'layer_sparsity': layer_sparsity
         }
     
     def reset(self):
-        """Clear stored activations."""
-        self.activations.clear()
+        """Clear activation statistics for next logging interval."""
+        self.activations = {}
     
     def remove_hooks(self):
         """Remove all registered hooks."""
         for handle in self.hooks:
             handle.remove()
-        self.hooks.clear()
+        self.hooks = []
 
 def build_tokenizer(job_config: JobConfig) -> AutoTokenizer:
     return AutoTokenizer.from_pretrained(job_config.model.tokenizer_path)
@@ -370,10 +398,21 @@ register_train_spec(
     )
 )
 
-# Register all audio denoising models
-
-
 # Enable debug tracing on failure: https://pytorch.org/docs/stable/elastic/errors.html
+register_train_spec(
+    TrainSpec(
+        name="audio_denoising_fla",
+        cls=AutoModel,
+        config=AutoConfig,
+        parallelize_fn=parallelize_fla,
+        pipelining_fn=pipeline_fla,
+        build_optimizers_fn=build_optimizers,
+        build_lr_schedulers_fn=build_lr_schedulers,
+        build_dataloader_fn=build_dataloader_audio,
+        build_tokenizer_fn=None,
+        build_loss_fn=None,
+    )
+)
 
 
 @record
@@ -578,6 +617,8 @@ def main(job_config: JobConfig):
     else:
         init_device = device_type
 
+
+   
     # apply parallelisms and initialization
     if parallel_dims.pp_enabled:
         # apply PT-D Pipeline Parallel
@@ -621,10 +662,16 @@ def main(job_config: JobConfig):
 
         model_parts = [model]
 
-    
+
     activation_tracker = ActivationSparsityTracker(threshold=1e-6)
-    for model in model_parts:
-        activation_tracker.register_hooks(model)
+    for m in model_parts:
+        # Register hooks directly on the FSDP-wrapped model
+        # Do NOT unwrap with .module or ._fsdp_wrapped_module
+        activation_tracker.register_hooks(m)
+    
+    logger.info(f"Total hooks registered: {len(activation_tracker.hooks)}")
+    
+    
     device_mem_stats = device_memory_monitor.get_peak_stats()
     logger.info(
         f"{device_type.upper()} memory usage for model: "
