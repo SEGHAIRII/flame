@@ -255,116 +255,7 @@ def calculate_sparsity(model_parts, threshold=1e-5):
     }
 
     
-class ActivationSparsityTracker:
-    """Track activation sparsity during forward pass."""
-    
-    def __init__(self, threshold=1e-6):
-        self.threshold = threshold
-        self.activations = {}
-        self.hooks = []
-    
-    def register_hooks(self, model):
-        
-        logger.info(f"Registering hooks on FSDP model type: {type(model)}")
-        
-        # Don't unwrap - iterate directly on the FSDP-wrapped model
-        hook_count = 0
-        for name, module in model.named_modules():
-            # Look for out_proj Linear modules
-            if 'out_proj' in name and isinstance(module, torch.nn.Linear):
-                logger.info(f"Found out_proj: {name} (type: {type(module)})")
-                
-                # Use closure to capture the correct layer name
-                def make_hook(layer_name):
-                    def hook(mod, input, output):
-                        # Capture the INPUT to out_proj
-                        if isinstance(input, tuple) and len(input) > 0:
-                            act = input[0]
-                        elif torch.is_tensor(input):
-                            act = input
-                        else:
-                            return
-                        
-                        
-                        print(f"Activation input shape for {layer_name}: {act.shape}", flush=True)                        # Store activation sparsity info
-                        if act is not None and torch.is_tensor(act):
-                            with torch.no_grad():
-                                act_flat = act.flatten()
-                                total = act_flat.numel()
-                                zeros = (act_flat.abs() < self.threshold).sum().item()
-                                sparsity = (zeros / total * 100) if total > 0 else 0
-                                
-                                # Accumulate statistics (hooks fire multiple times per batch)
-                                if layer_name not in self.activations:
-                                    self.activations[layer_name] = {
-                                        'total': 0,
-                                        'zeros': 0,
-                                        'sparsity': 0
-                                    }
-                                
-                                self.activations[layer_name]['total'] += total
-                                self.activations[layer_name]['zeros'] += zeros
-                                # Recalculate sparsity percentage
-                                self.activations[layer_name]['sparsity'] = (
-                                    self.activations[layer_name]['zeros'] / 
-                                    self.activations[layer_name]['total'] * 100
-                                )
-                    return hook
-                
-                handle = module.register_forward_hook(make_hook(name))
-                self.hooks.append(handle)
-                hook_count += 1
-                logger.info(f"✓ Registered hook {hook_count}: {name}")
-        
-        logger.info(f"=== Total hooks registered: {hook_count} ===")
-    
-    def get_statistics(self):
-        """
-        Compute overall activation sparsity statistics.
-        
-        Returns:
-            dict: Contains 'overall_sparsity', 'total_activations', 'zero_activations', 
-                  and 'layer_sparsity' (per-layer sparsity percentages)
-        """
-        if not self.activations:
-            logger.warning("No activations captured!")
-            return {
-                'overall_sparsity': 0.0,
-                'total_activations': 0,
-                'zero_activations': 0,
-                'layer_sparsity': {}
-            }
-        
-        total_activations = sum(stats['total'] for stats in self.activations.values())
-        zero_activations = sum(stats['zeros'] for stats in self.activations.values())
-        
-        overall_sparsity = (
-            (zero_activations / total_activations * 100) 
-            if total_activations > 0 else 0.0
-        )
-        
-        # Per-layer sparsity
-        layer_sparsity = {
-            name: stats['sparsity'] 
-            for name, stats in self.activations.items()
-        }
-        
-        return {
-            'overall_sparsity': overall_sparsity,
-            'total_activations': total_activations,
-            'zero_activations': zero_activations,
-            'layer_sparsity': layer_sparsity
-        }
-    
-    def reset(self):
-        """Clear activation statistics for next logging interval."""
-        self.activations = {}
-    
-    def remove_hooks(self):
-        """Remove all registered hooks."""
-        for handle in self.hooks:
-            handle.remove()
-        self.hooks = []
+
 
 def build_tokenizer(job_config: JobConfig) -> AutoTokenizer:
     return AutoTokenizer.from_pretrained(job_config.model.tokenizer_path)
@@ -398,7 +289,7 @@ register_train_spec(
     )
 )
 
-# Enable debug tracing on failure: https://pytorch.org/docs/stable/elastic/errors.html
+#register audio denoising models
 register_train_spec(
     TrainSpec(
         name="audio_denoising_fla",
@@ -661,15 +552,6 @@ def main(job_config: JobConfig):
         model.train()
 
         model_parts = [model]
-
-
-    activation_tracker = ActivationSparsityTracker(threshold=1e-6)
-    for m in model_parts:
-        # Register hooks directly on the FSDP-wrapped model
-        # Do NOT unwrap with .module or ._fsdp_wrapped_module
-        activation_tracker.register_hooks(m)
-    
-    logger.info(f"Total hooks registered: {len(activation_tracker.hooks)}")
     
     
     device_mem_stats = device_memory_monitor.get_peak_stats()
@@ -977,22 +859,7 @@ def main(job_config: JobConfig):
 
                
                 sparsity_metrics = calculate_sparsity(model_parts)
-                activation_sparsity = activation_tracker.get_statistics()
-                if parallel_dims.dp_enabled:
-                    # Convert to tensors for all_reduce
-                    total_acts = torch.tensor(activation_sparsity['total_activations'], device=device)
-                    zero_acts = torch.tensor(activation_sparsity['zero_activations'], device=device)
-                    
-                    torch.distributed.all_reduce(total_acts, group=world_mesh["dp"].get_group())
-                    torch.distributed.all_reduce(zero_acts, group=world_mesh["dp"].get_group())
-                    
-                    activation_sparsity['total_activations'] = total_acts.item()
-                    activation_sparsity['zero_activations'] = zero_acts.item()
-                    activation_sparsity['overall_sparsity'] = (
-                        zero_acts / total_acts * 100 if total_acts > 0 else 0
-                    ).item()
-                
-                activation_tracker.reset()   
+                activation_sparsity = output.activation_sparsities  
                 # Update train state tokens and elapsed time
                 time_now = time.perf_counter()
                 time_delta = (
@@ -1022,24 +889,25 @@ def main(job_config: JobConfig):
                     "optimizer/skipped_step": train_state.skipped_step,
                     "sparsity/weights_overall": sparsity_metrics['overall_sparsity'],
                     "sparsity/weights_zero_params": sparsity_metrics['zero_params'],
-                    "sparsity/activations_overall": activation_sparsity['overall_sparsity'],
-                    "sparsity/activations_zero": activation_sparsity['zero_activations'],
                 }
                 for layer_name, sparsity_pct in sparsity_metrics['layer_sparsity'].items():
                     extra_metrics[f"sparsity/layer_{layer_name}"] = sparsity_pct
                 
                 
                 # Add per-layer activation sparsity (top 5 most sparse)
-                sorted_act_sparsity = sorted(
-                    activation_sparsity['layer_sparsity'].items(),
-                    key=lambda x: x[1],
-                    reverse=True
-                )[:5]  # Only log top 5 to avoid cluttering
-                for layer_name, sparsity_pct in sorted_act_sparsity:
+                # sorted_act_sparsity = sorted(
+                #     activation_sparsity['layer_sparsity'].items(),
+                #     key=lambda x: x[1],
+                #     reverse=True
+                # )[:5]
+                # activation_sparsity = {}
+                for layer_num, activation_sparsity in enumerate(output.activation_sparsities):
                     # Shorten layer names for cleaner logging
-                    short_name = layer_name.split('.')[-1]
-                    extra_metrics[f"sparsity/act_{short_name}"] = sparsity_pct
-                
+                    extra_metrics[f"sparsity/act_layer{layer_num}"] = activation_sparsity
+                    # activation_sparsity[f"layer{layer_num}"] = activation_sparsity
+                    logger.info(
+                        f"Activation Sparsity - Layer {layer_num}: {activation_sparsity:.2f}%"
+                    )
                 
                 metric_logger.log(
                     train_state.step,
@@ -1052,7 +920,7 @@ def main(job_config: JobConfig):
                 logger.info(
                     f"{color.blue}lr: {last_lr:.4e} gnorm: {grad_norm:5.2f} "
                     f"{color.cyan}weight_sp: {sparsity_metrics['overall_sparsity']:.2f}% "
-                    f"{color.yellow}act_sp: {activation_sparsity['overall_sparsity']:.2f}% "
+                    # f"{color.yellow}act_sp: {activation_sparsity['overall_sparsity']:.2f}% "
                     f"{color.magenta}[{str(train_state.elapsed).split('.')[0]:>8}<{str(eta).split('.')[0]:>8}]{color.reset}"
                 )
 
@@ -1078,8 +946,6 @@ def main(job_config: JobConfig):
         logger.info("Sleeping 2 seconds for other ranks to complete")
         time.sleep(2)
     
-    activation_tracker.remove_hooks()
-
 
     metric_logger.close()
     logger.info("Training completed")
