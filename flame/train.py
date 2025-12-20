@@ -433,6 +433,7 @@ def main(job_config: JobConfig):
             "dataset": dataset,
             "tokenizer": tokenizer,
             "rank": dp_rank,
+            "world_size": dp_degree
         } | train_args
         
 
@@ -859,7 +860,6 @@ def main(job_config: JobConfig):
 
                
                 sparsity_metrics = calculate_sparsity(model_parts)
-                activation_sparsity = output.activation_sparsities  
                 # Update train state tokens and elapsed time
                 time_now = time.perf_counter()
                 time_delta = (
@@ -890,8 +890,6 @@ def main(job_config: JobConfig):
                     "sparsity/weights_overall": sparsity_metrics['overall_sparsity'],
                     "sparsity/weights_zero_params": sparsity_metrics['zero_params'],
                 }
-                for layer_name, sparsity_pct in sparsity_metrics['layer_sparsity'].items():
-                    extra_metrics[f"sparsity/layer_{layer_name}"] = sparsity_pct
                 
                 
                 # Add per-layer activation sparsity (top 5 most sparse)
@@ -901,12 +899,21 @@ def main(job_config: JobConfig):
                 #     reverse=True
                 # )[:5]
                 # activation_sparsity = {}
-                for layer_num, activation_sparsity in enumerate(output.activation_sparsities):
-                    # Shorten layer names for cleaner logging
-                    extra_metrics[f"sparsity/act_layer{layer_num}"] = activation_sparsity
-                    # activation_sparsity[f"layer{layer_num}"] = activation_sparsity
+                if output.activation_sparsities:
+                    act_sparsities = output.activation_sparsities
+                    extra_metrics["sparsity/act_overall"] = sum(act_sparsities) / len(act_sparsities)
+                    extra_metrics["sparsity/act_min"] = min(act_sparsities)
+                    extra_metrics["sparsity/act_max"] = max(act_sparsities)
+                    extra_metrics["sparsity/act_std"] = torch.tensor(act_sparsities).std().item()
+                    
+                    # Optional: Log only first, middle, and last layers
+                    extra_metrics["sparsity/act_layer_first"] = act_sparsities[0]
+                    extra_metrics["sparsity/act_layer_middle"] = act_sparsities[len(act_sparsities)//2]
+                    extra_metrics["sparsity/act_layer_last"] = act_sparsities[-1]
+                    
                     logger.info(
-                        f"Activation Sparsity - Layer {layer_num}: {activation_sparsity:.2f}%"
+                        f"Activation Sparsity - Overall: {extra_metrics['sparsity/act_overall']:.2f}% "
+                        f"[Min: {extra_metrics['sparsity/act_min']:.2f}%, Max: {extra_metrics['sparsity/act_max']:.2f}%]"
                     )
                 
                 metric_logger.log(
@@ -914,7 +921,7 @@ def main(job_config: JobConfig):
                     global_avg_loss,
                     global_max_loss,
                     extra_metrics=extra_metrics,
-                )
+                ) 
                 
 
                 logger.info(
