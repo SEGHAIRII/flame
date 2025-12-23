@@ -14,7 +14,7 @@ from torch.distributed.checkpoint.format_utils import dcp_to_torch_save
 from torchtitan.tools.logging import init_logger, logger
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
-import custom_models
+from sparse_mamba import custom_models
 
 
 @torch.inference_mode()
@@ -35,7 +35,8 @@ def save_pretrained(
     tokenizer.save_pretrained(path)
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        checkpoint = os.path.join(path, f'checkpoint/step-{step}')
+        checkpoint = os.path.join(path, f'step-{step}')
+        logger.info(f"the checkpoint path is {checkpoint}")
         checkpoint_path = os.path.join(tmpdir, 'checkpoint.pt')
         logger.info(f"Saving the distributed checkpoint to {checkpoint_path}")
         dcp_to_torch_save(checkpoint, checkpoint_path)
