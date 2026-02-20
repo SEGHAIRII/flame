@@ -52,7 +52,7 @@ def save_pretrained(
         model.load_state_dict(torch.load(checkpoint_path, map_location='cpu')['model'])
 
         logger.info(f"Saving the model to {path}")
-        model.save_pretrained(path)
+        model.save_pretrained(path, safe_serialization = False)
 
 
 if __name__ == "__main__":

@@ -161,6 +161,12 @@ class JobConfig:
             help="Trace files location",
         )
         self.parser.add_argument(
+            "--training.target_threshold",
+            type=float,
+            default=0.0,
+            help="Threshold to shift relu by",
+        )
+        self.parser.add_argument(
             "--profiling.profile_freq",
             type=int,
             default=10,

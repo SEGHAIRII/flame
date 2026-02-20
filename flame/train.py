@@ -10,6 +10,7 @@ import time
 from datetime import timedelta
 from pathlib import Path
 import sys
+import math
 
 # to import custom_models from sparse_mamba
 # sparse_mamba_path = Path(__file__).parent.parent.parent
@@ -47,6 +48,23 @@ from flame.data import build_dataloader_causal, build_dataset
 from flame.models.parallelize_fla import parallelize_fla
 from flame.models.pipeline_fla import pipeline_fla
 from flame.tools.utils import get_nparams_and_flops
+
+
+def Threshold_Schedular(step, total_steps, start_value, target_value):
+    """
+    S-Curve Hyperparameter Scheduler
+    Slow start -> Fast middle -> Slow end
+    """
+    if step >= total_steps:
+        return target_value
+
+    progress = step / total_steps
+
+    factor = 0.5 * (1 - math.cos(math.pi * progress))
+
+    # 4. Calculate the new value
+    return start_value + (target_value - start_value) * factor
+
 
 def erk_sparsity_distribution(model_parts, current_sparsity):
     """
@@ -262,16 +280,6 @@ def build_tokenizer(job_config: JobConfig) -> AutoTokenizer:
 
 # to do : see the loss function
 # modify the flops per token calculation...
-
-# def relufication_step_2(model:torch.nn.Module):
-    for layer in model.backbone.layers:
-        # Wrap norm and add ReLU
-        original_norm = layer.norm
-        layer.norm = torch.nn.Sequential(
-            original_norm,
-            torch.nn.ReLU()
-        )
-
 
 # Register all causal lm models
 register_train_spec(
@@ -668,7 +676,7 @@ def main(job_config: JobConfig):
     
     
     
-    
+        
     
     update_sparsity_every_n_steps = job_config.training.update_sparsity_steps
     current_sparsity = 0.0
@@ -676,7 +684,15 @@ def main(job_config: JobConfig):
     pruning_masks = None
     erk_sparsities = None
     enable_weight_sparsification = job_config.training.enable_weight_sparsification
+    threshold = job_config.training.target_threshold
+    # hard_mamba
+    sparsity_loss_start = 0.0
+    sparsity_loss_end = 1.0
+    sparsity_loss_weight = 0.0
     
+    # tau_start = 1.0
+    # tau_end = 0.1
+    # tau = tau_start
     with (
         maybe_enable_profiling(
             job_config, global_step=train_state.step
@@ -686,6 +702,8 @@ def main(job_config: JobConfig):
         ) as memory_profiler,
     ):
         while train_state.step < job_config.training.steps:
+            sparsity_loss_weight = Threshold_Schedular(train_state.step, job_config.training.steps, sparsity_loss_start, sparsity_loss_end)
+            # tau = Threshold_Schedular(train_state.step, job_config.training.steps, tau_start, tau_end)
             train_state.step += 1
             if enable_weight_sparsification:
                 if  train_state.step % update_sparsity_every_n_steps == 0:
@@ -707,13 +725,18 @@ def main(job_config: JobConfig):
                     
                 apply_masks_to_weights(model_parts, pruning_masks)  
             
-                
+             
+             # Updating the threshold
+             
+            # threshold = Threshold_Schedular(train_state.step, job_config.training.steps, 0.0, job_config.training.target_threshold)    
             
             gc_handler.run(train_state.step)
 
             optimizers.zero_grad()
 
             losses = []
+            # main_losses = []
+            # sparsity_losses = []
             # do gradient accumulation if enabled
             for _ in range(job_config.training.gradient_accumulation_steps):
                 # get batch
@@ -803,7 +826,9 @@ def main(job_config: JobConfig):
                                 labels=labels,
                                 position_ids=position_ids,
                                 cu_seqlens=cu_seqlens,
-                        )
+                                threshold=threshold,
+                                # tau=tau,
+                            )
                         loss = (
                             output.loss
                             / job_config.training.gradient_accumulation_steps
@@ -812,8 +837,26 @@ def main(job_config: JobConfig):
 
                 losses.append(loss)
             loss = sum(losses)
+            #             main_loss = (
+            #                 output.loss
+            #                 / job_config.training.gradient_accumulation_steps
+            #             )
+            #             sparsity_loss = (
+            #                 output.regularization_term
+            #                 / job_config.training.gradient_accumulation_steps
+            #             )
+            #             total_loss = main_loss + sparsity_loss * sparsity_loss_weight
+            #             total_loss.backward()
 
-            # clip gradients
+            #     losses.append(total_loss)
+            #     main_losses.append(main_loss)
+            #     sparsity_losses.append(sparsity_loss)
+            
+            # loss = sum(losses)
+            # main_loss_sum = sum(main_losses)
+            # sparsity_loss_sum = sum(sparsity_losses)
+
+             # clip gradients
             grad_norm = dist_utils.clip_grad_norm_(
                 [p for m in model_parts for p in m.parameters()],
                 job_config.training.max_norm,
@@ -833,9 +876,14 @@ def main(job_config: JobConfig):
                 train_state.skipped_step += 1
             else:
                 optimizers.step()
+            
             lr_schedulers.step()
+            
+             
 
-            # log metrics - Use MetricsProcessor
+                # ------------------------
+                # Logging
+                # ------------------------
             if metric_logger.should_log(train_state.step):
                 if (
                     parallel_dims.dp_replicate_enabled
@@ -857,75 +905,94 @@ def main(job_config: JobConfig):
                 else:
                     # Scale back the loss before logging
                     global_avg_loss = global_max_loss = loss.item()
+                #     loss = loss.detach()
+                #     main_loss_sum = main_loss_sum.detach()
+                #     sparsity_loss_sum = sparsity_loss_sum.detach()
+                    
+                #     # Use dist_mean/max on the accumulated loss for the step
+                #     global_avg_loss, global_max_loss = (
+                #         dist_utils.dist_mean(
+                #             loss,
+                #             world_mesh["dp_cp"],
+                #         ),
+                #         dist_utils.dist_max(
+                #             loss,
+                #             world_mesh["dp_cp"],
+                #         ),
+                #     )
+                    
+                #     global_avg_main_loss = dist_utils.dist_mean(
+                #         main_loss_sum,
+                #         world_mesh["dp_cp"],
+                #     )
+                    
+                #     global_avg_sparsity_loss = dist_utils.dist_mean(
+                #         sparsity_loss_sum,
+                #         world_mesh["dp_cp"],
+                #     )
+                # else:
+                #     # Scale back the loss before logging
+                #     global_avg_loss = global_max_loss = loss.item()
+                #     global_avg_main_loss = main_loss_sum.item()
+                #     global_avg_sparsity_loss = sparsity_loss_sum.item()
 
-               
                 sparsity_metrics = calculate_sparsity(model_parts)
-                # Update train state tokens and elapsed time
+
                 time_now = time.perf_counter()
-                time_delta = (
-                    time_now - metric_logger.time_last_log
-                )  # Use metric_logger's time
+                time_delta = time_now - metric_logger.time_last_log
+
                 train_state.token += (
-                    metric_logger.ntokens_since_last_log  # Use tokens tracked by metric_logger
+                    metric_logger.ntokens_since_last_log
                     * parallel_dims.world_size
                     / parallel_dims.non_data_parallel_size
                 )
                 train_state.elapsed += timedelta(seconds=time_delta)
+
                 train_state.log_steps.append(train_state.step)
                 train_state.global_avg_losses.append(global_avg_loss)
                 train_state.global_max_losses.append(global_max_loss)
 
-                # Log using the metric processor
                 last_lr = lr_schedulers.schedulers[0].get_last_lr()[0]
                 eta = (
-                    train_state.elapsed
-                    * (job_config.training.steps - train_state.step)
-                    / train_state.step
+                        train_state.elapsed
+                        * (job_config.training.steps - train_state.step)
+                        / train_state.step
                 )
-                
+
                 extra_metrics = {
-                    "optimizer/lr": last_lr,
-                    "optimizer/grad_norm": grad_norm.item(),
-                    "optimizer/skipped_step": train_state.skipped_step,
-                    "sparsity/weights_overall": sparsity_metrics['overall_sparsity'],
-                    "sparsity/weights_zero_params": sparsity_metrics['zero_params'],
+                        "optimizer/lr": last_lr,
+                        "optimizer/grad_norm": grad_norm.item(),
+                        "optimizer/skipped_step": train_state.skipped_step,
+                        # "loss/main_loss": global_avg_main_loss,
+                        # "loss/sparsity_loss": global_avg_sparsity_loss,
+                        "sparsity/weights_overall": sparsity_metrics["overall_sparsity"],
+                        "sparsity/weights_zero_params": sparsity_metrics["zero_params"],
                 }
-                
-                
-                # Add per-layer activation sparsity (top 5 most sparse)
-                # sorted_act_sparsity = sorted(
-                #     activation_sparsity['layer_sparsity'].items(),
-                #     key=lambda x: x[1],
-                #     reverse=True
-                # )[:5]
-                # activation_sparsity = {}
+
                 if output.activation_sparsities:
                     act_sparsities = output.activation_sparsities
-                    extra_metrics["sparsity/act_overall"] = sum(act_sparsities) / len(act_sparsities)
-                    extra_metrics["sparsity/act_min"] = min(act_sparsities)
-                    extra_metrics["sparsity/act_max"] = max(act_sparsities)
-                    extra_metrics["sparsity/act_std"] = torch.tensor(act_sparsities).std().item()
-                    
-                    # Optional: Log only first, middle, and last layers
-                    extra_metrics["sparsity/act_layer_first"] = act_sparsities[0]
-                    extra_metrics["sparsity/act_layer_middle"] = act_sparsities[len(act_sparsities)//2]
-                    extra_metrics["sparsity/act_layer_last"] = act_sparsities[-1]
-                    
-                    logger.info(
-                        f"Activation Sparsity - Overall: {extra_metrics['sparsity/act_overall']:.2f}% "
-                        f"[Min: {extra_metrics['sparsity/act_min']:.2f}%, Max: {extra_metrics['sparsity/act_max']:.2f}%]"
-                    )
-                
+                    extra_metrics.update({
+                            "sparsity/act_overall": sum(act_sparsities) / len(act_sparsities),
+                            "sparsity/act_min": min(act_sparsities),
+                            "sparsity/act_max": max(act_sparsities),
+                            "sparsity/act_std": torch.tensor(act_sparsities).std().item(),
+                            "sparsity/act_layer_first": act_sparsities[0],
+                            "sparsity/act_layer_middle": act_sparsities[len(act_sparsities) // 2],
+                            "sparsity/act_layer_last": act_sparsities[-1],
+                    })
+
                 metric_logger.log(
-                    train_state.step,
-                    global_avg_loss,
-                    global_max_loss,
-                    extra_metrics=extra_metrics,
-                ) 
-                
+                        train_state.step,
+                        global_avg_loss,   # ← primary loss shown in dashboards
+                        global_max_loss,
+                        extra_metrics=extra_metrics,
+                )
+
 
                 logger.info(
                     f"{color.blue}lr: {last_lr:.4e} gnorm: {grad_norm:5.2f} "
+                    # f"{color.green}loss: {global_avg_loss:.4f} (main: {global_avg_main_loss:.4f} + sparse: {global_avg_sparsity_loss:.4f}) "
+                        f"{color.green}loss: {global_avg_loss:.4f} "
                     f"{color.cyan}weight_sp: {sparsity_metrics['overall_sparsity']:.2f}% "
                     # f"{color.yellow}act_sp: {activation_sparsity['overall_sparsity']:.2f}% "
                     f"{color.magenta}[{str(train_state.elapsed).split('.')[0]:>8}<{str(eta).split('.')[0]:>8}]{color.reset}"
