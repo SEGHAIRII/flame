@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from typing import Optional, Dict, List, Any
 from datetime import datetime
 from pathlib import Path
+import math
 
 import torch
 import torch.nn as nn
@@ -34,6 +35,18 @@ try:
     HAS_WANDB = True
 except ImportError:
     HAS_WANDB = False
+    
+    
+def Reg_Schedular(step, total_steps, start_value, target_value):
+    """
+    S-Curve Hyperparameter Scheduler
+    Slow start -> Fast middle -> Slow end
+    """
+    if step >= total_steps:
+        return target_value
+    progress = step / total_steps
+    factor = 0.5 * (1 - math.cos(math.pi * progress))
+    return start_value + (target_value - start_value) * factor
 
 
 # ============================================================================
@@ -251,27 +264,101 @@ def setup_distributed(job_config):
 # TRAIN STEP  (unchanged)
 # ============================================================================
 
-def train_step(model, batch, optimizer, scheduler, grad_accum_steps, max_grad_norm, device, scaler=None):
+# def train_step(model, batch, optimizer, scheduler, grad_accum_steps, max_grad_norm, device, scaler=None):
+#     inputs         = batch['features'].to(device, dtype=torch.float32).transpose(1, 2)
+#     labels         = batch['targets'].to(device, dtype=torch.long)
+#     input_lengths  = batch['feature_lengths'].to(device, dtype=torch.long)
+#     target_lengths = batch['target_lengths'].to(device, dtype=torch.long)
+#     total_loss = torch.tensor(0.0, device=device)
+#     last_output = None
+#     for _ in range(grad_accum_steps):
+#         if scaler:
+#             with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+#                 loss = model(input_ids=inputs, labels=labels,
+#                              input_lengths=input_lengths, target_lengths=target_lengths).loss / grad_accum_steps
+#             # torch.autograd.set_detect_anomaly(True)
+#             last_output = loss
+#             print("Loss before backward:", loss.item())    
+#             scaler.scale(loss).backward()
+#         else:
+#             loss = model(input_ids=inputs, labels=labels,
+#                          input_lengths=input_lengths, target_lengths=target_lengths).loss / grad_accum_steps
+#             loss.backward()
+#         total_loss += loss.detach()
+
+#     if scaler: scaler.unscale_(optimizer)
+#     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+#     if scaler: scaler.step(optimizer); scaler.update()
+#     else:      optimizer.step()
+#     if scheduler: scheduler.step()
+#     optimizer.zero_grad()
+#     act_sparsities = getattr(last_output, 'all_sparsities', [])
+    
+#     return total_loss, {
+#         'loss': total_loss.item(), 'grad_norm': grad_norm.item(),
+#         'lr': scheduler.get_last_lr()[0] if scheduler else optimizer.param_groups[0]['lr'],
+#         'activation_sparsities': act_sparsities,
+#     }
+
+
+
+
+def train_step(model, batch, optimizer, scheduler, grad_accum_steps, max_grad_norm,
+               device, scaler=None, global_step=0, total_steps=1,
+               reg_start_value=0.0, reg_target_value=0.0):
+
     inputs         = batch['features'].to(device, dtype=torch.float32).transpose(1, 2)
     labels         = batch['targets'].to(device, dtype=torch.long)
     input_lengths  = batch['feature_lengths'].to(device, dtype=torch.long)
     target_lengths = batch['target_lengths'].to(device, dtype=torch.long)
-    total_loss = torch.tensor(0.0, device=device)
-    last_output = None
+
+    # Compute reg lambda for this step
+    reg_lambda = Reg_Schedular(global_step, total_steps, reg_start_value, reg_target_value)
+
+    total_loss     = torch.tensor(0.0, device=device)
+    total_ctc_loss = torch.tensor(0.0, device=device)
+    total_reg_loss = torch.tensor(0.0, device=device)
+    last_output    = None
+
     for _ in range(grad_accum_steps):
         if scaler:
             with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-                loss = model(input_ids=inputs, labels=labels,
-                             input_lengths=input_lengths, target_lengths=target_lengths).loss / grad_accum_steps
-            # torch.autograd.set_detect_anomaly(True)
-            last_output = loss
-            print("Loss before backward:", loss.item())    
+                output = model(input_ids=inputs, labels=labels,
+                               input_lengths=input_lengths,
+                               target_lengths=target_lengths)
+                ctc_loss = output.loss / grad_accum_steps
+                reg_term = getattr(output, 'regularization_term', None)
+
+                if reg_term is not None and reg_lambda > 0.0:
+                    reg_loss = (reg_lambda * reg_term) / grad_accum_steps
+                    loss = ctc_loss + reg_loss
+                else:
+                    reg_loss = torch.tensor(0.0, device=device)
+                    loss = ctc_loss
+
+            last_output = output
+            print("Loss before backward:", loss.item())
             scaler.scale(loss).backward()
         else:
-            loss = model(input_ids=inputs, labels=labels,
-                         input_lengths=input_lengths, target_lengths=target_lengths).loss / grad_accum_steps
+            output = model(input_ids=inputs, labels=labels,
+                           input_lengths=input_lengths,
+                           target_lengths=target_lengths)
+            ctc_loss = output.loss / grad_accum_steps
+            reg_term = output.regularization_term
+
+            if reg_term is not None and reg_lambda > 0.0:
+                reg_loss = (reg_lambda * reg_term) / grad_accum_steps
+                loss = ctc_loss + reg_loss
+            else:
+                reg_loss = torch.tensor(0.0, device=device)
+                loss = ctc_loss
+
+            last_output = output
             loss.backward()
-        total_loss += loss.detach()
+
+        total_loss     += loss.detach()
+        total_ctc_loss += ctc_loss.detach()
+        total_reg_loss += reg_loss.detach()
 
     if scaler: scaler.unscale_(optimizer)
     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
@@ -279,14 +366,19 @@ def train_step(model, batch, optimizer, scheduler, grad_accum_steps, max_grad_no
     else:      optimizer.step()
     if scheduler: scheduler.step()
     optimizer.zero_grad()
+
     act_sparsities = getattr(last_output, 'all_sparsities', [])
-    
+
     return total_loss, {
-        'loss': total_loss.item(), 'grad_norm': grad_norm.item(),
-        'lr': scheduler.get_last_lr()[0] if scheduler else optimizer.param_groups[0]['lr'],
+        'loss':              total_loss.item(),
+        'loss_ctc':          total_ctc_loss.item(),
+        'loss_reg':          total_reg_loss.item(),
+        'loss_reg_raw':      reg_term.item() if (reg_term is not None) else 0.0,
+        'reg_lambda':        reg_lambda,
+        'grad_norm':         grad_norm.item(),
+        'lr':                scheduler.get_last_lr()[0] if scheduler else optimizer.param_groups[0]['lr'],
         'activation_sparsities': act_sparsities,
     }
-
 
 # ============================================================================
 # EVALUATE  (unchanged)
@@ -423,22 +515,36 @@ def main(job_config: JobConfig):
             batch = next(train_iter)
             train_state.epoch += 1
 
-        loss, metrics = train_step(model, batch, optimizer, scheduler,
-                                   job_config.training.gradient_accumulation_steps,
-                                   job_config.training.max_norm, device, scaler)
+        loss, metrics = train_step(
+            model, batch, optimizer, scheduler,
+            job_config.training.gradient_accumulation_steps,
+            job_config.training.max_norm,
+            device, scaler,
+            global_step=global_step,
+            total_steps=job_config.training.steps,
+            reg_start_value=getattr(job_config.training, 'reg_start_value', 0.0),
+            reg_target_value=getattr(job_config.training, 'reg_target_value', 0.0),
+        )
 
+        # In main() - update wandb logging block
         if global_step % job_config.metrics.log_freq == 0:
-            # logger.info(f"Step {global_step}/{job_config.training.steps} | "
-            #             f"Loss: {metrics['loss']:.4f} | LR: {metrics['lr']:.6f} | "
-            #             f"GradNorm: {metrics['grad_norm']:.2f}")
             if HAS_WANDB and job_config.metrics.enable_wandb and local_rank == 0:
-                wandb_log = {'train/loss': metrics['loss'], 'train/lr': metrics['lr'],
-                            'train/grad_norm': metrics['grad_norm'], 'train/step': global_step}
-                if 'act_sparsity_mean' in metrics:
+                wandb_log = {
+                    'train/loss':         metrics['loss'],
+                    'train/loss_ctc':     metrics['loss_ctc'],
+                    'train/loss_reg':     metrics['loss_reg'],
+                    'train/loss_reg_raw': metrics['loss_reg_raw'],
+                    'train/reg_lambda':   metrics['reg_lambda'],
+                    'train/lr':           metrics['lr'],
+                    'train/grad_norm':    metrics['grad_norm'],
+                    'train/step':         global_step,
+                }
+                if metrics['activation_sparsities']:
+                    sparsities = metrics['activation_sparsities']
                     wandb_log.update({
-                        'sparsity/act_mean': metrics['act_sparsity_mean'],
-                        'sparsity/act_min': metrics['act_sparsity_min'],
-                        'sparsity/act_max': metrics['act_sparsity_max'],
+                        'sparsity/act_mean': sum(sparsities) / len(sparsities),
+                        'sparsity/act_min':  min(sparsities),
+                        'sparsity/act_max':  max(sparsities),
                     })
                 wandb.log(wandb_log)
 
