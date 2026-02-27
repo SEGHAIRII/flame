@@ -41,6 +41,39 @@ def levenshtein_distance(seq1, seq2):
     return prev[-1]
 
 
+# def calculate_asr_metrics(predictions, targets, idx_to_char=None):
+#     metrics = {
+#         'cer': 0.0, 'wer': 0.0, 'exact_match': 0.0, 'token_accuracy': 0.0,
+#         'total_chars': 0, 'total_words': 0, 'total_sequences': len(predictions)
+#     }
+#     if not predictions:
+#         return metrics
+
+#     tce = twe = tc = tw = em = tk_c = tk_t = 0
+#     for pred, target in zip(predictions, targets):
+#         pred   = pred.tolist()   if torch.is_tensor(pred)   else list(pred)
+#         target = target.tolist() if torch.is_tensor(target) else list(target)
+#         pc  = [p for p in pred   if p != 0]
+#         tc_ = [t for t in target if t != 0]
+#         tce += levenshtein_distance(pc, tc_)
+#         tc  += len(tc_)
+#         twe += levenshtein_distance(pred, target)
+#         tw  += len(target)
+#         em  += pred == target
+#         ml   = min(len(pred), len(target))
+#         tk_c += sum(pred[i] == target[i] for i in range(ml))
+#         tk_t += max(len(pred), len(target))
+
+#     metrics.update(
+#         cer=tce / max(tc, 1),
+#         wer=twe / max(tw, 1),
+#         exact_match=em / len(predictions),
+#         token_accuracy=tk_c / max(tk_t, 1),
+#         total_chars=tc,
+#         total_words=tw,
+#     )
+#     return metrics
+
 def calculate_asr_metrics(predictions, targets, idx_to_char=None):
     metrics = {
         'cer': 0.0, 'wer': 0.0, 'exact_match': 0.0, 'token_accuracy': 0.0,
@@ -51,18 +84,34 @@ def calculate_asr_metrics(predictions, targets, idx_to_char=None):
 
     tce = twe = tc = tw = em = tk_c = tk_t = 0
     for pred, target in zip(predictions, targets):
-        pred   = pred.tolist()   if torch.is_tensor(pred)   else list(pred)
+        pred   = pred.tolist() if torch.is_tensor(pred)   else list(pred)
         target = target.tolist() if torch.is_tensor(target) else list(target)
+
+        # CER — filter blanks, compare character tokens
         pc  = [p for p in pred   if p != 0]
         tc_ = [t for t in target if t != 0]
         tce += levenshtein_distance(pc, tc_)
         tc  += len(tc_)
-        twe += levenshtein_distance(pred, target)
-        tw  += len(target)
-        em  += pred == target
-        ml   = min(len(pred), len(target))
-        tk_c += sum(pred[i] == target[i] for i in range(ml))
-        tk_t += max(len(pred), len(target))
+
+        # WER — convert to text, split into words, compare word sequences
+        if idx_to_char:
+            pred_text   = "".join([idx_to_char.get(t, "") for t in pc])
+            target_text = "".join([idx_to_char.get(t, "") for t in tc_])
+            pred_words   = pred_text.strip().split()
+            target_words = target_text.strip().split()
+        else:
+            # fallback if no idx_to_char — WER will equal CER
+            pred_words   = pc
+            target_words = tc_
+
+        twe += levenshtein_distance(pred_words, target_words)
+        tw  += len(target_words)
+
+        # exact match and token accuracy unchanged
+        em   += pc == tc_
+        ml    = min(len(pc), len(tc_))
+        tk_c += sum(pc[i] == tc_[i] for i in range(ml))
+        tk_t += max(len(pc), len(tc_))
 
     metrics.update(
         cer=tce / max(tc, 1),
@@ -128,8 +177,22 @@ def peek_checkpoint(checkpoint_path: str):
     return num_layers, hidden_size, step, state_dict
 
 
+# def load_checkpoint(model, state_dict):
+#     model.load_state_dict(state_dict, strict=True)
+#     return model
+
 def load_checkpoint(model, state_dict):
-    model.load_state_dict(state_dict, strict=True)
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+
+    threshold_missing = [k for k in missing if "_threshold_raw" in k]
+    real_missing      = [k for k in missing if "_threshold_raw" not in k]
+
+    if real_missing:
+        raise RuntimeError(f"Unexpected missing keys (not threshold params): {real_missing}")
+    if unexpected:
+        raise RuntimeError(f"Unexpected keys in checkpoint: {unexpected}")
+
+    print(f"Loaded checkpoint OK — {len(threshold_missing)} threshold params initialized from config default")
     return model
 
 
@@ -137,8 +200,124 @@ def load_checkpoint(model, state_dict):
 # DATALOADER
 # ============================================================================
 
+def count_parameters(model):
+    total     = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return total, trainable
+
+
+def format_params(n):
+    if n >= 1e9:
+        return f"{n/1e9:.2f}B"
+    if n >= 1e6:
+        return f"{n/1e6:.2f}M"
+    if n >= 1e3:
+        return f"{n/1e3:.2f}K"
+    return str(n)
+
+
+# ============================================================================
+# LATEX GENERATION
+# ============================================================================
+
+def save_latex(metrics: dict, args, step: int, num_layers: int,
+               hidden_size: int, total_params: int):
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    decoding  = f"beam{args.beam_size}" if args.beam_size > 1 else "greedy"
+    filename  = f"eval_{args.split}_{decoding}_{timestamp}.tex"
+    filepath  = output_dir / filename
+
+    model_label   = Path(args.checkpoint).parent.parent.name.replace('_', '\\_')
+    params_str    = format_params(total_params)
+    cer_pct       = round(metrics['cer'] * 100, 2)
+    wer_pct       = round(metrics['wer'] * 100, 2)
+    exact_pct     = round(metrics['exact_match'] * 100, 2)
+    tok_acc_pct   = round(metrics['token_accuracy'] * 100, 2)
+
+    has_sparsity  = 'act_sparsity_mean' in metrics
+    sparsity_mean = round(float(metrics['act_sparsity_mean']), 2) if has_sparsity else None
+
+    # column definition
+    col_def = "l c c c c c | c"
+    if has_sparsity:
+        col_def += " c"
+
+    header_cols = [
+        "Model", "Params", "Step",
+        "CER $\\downarrow$", "WER $\\downarrow$",
+        "Exact Match $\\uparrow$", "Token Acc $\\uparrow$",
+    ]
+    if has_sparsity:
+        header_cols.append("Sparsity $\\uparrow$")
+
+    row_cols = [
+        model_label,
+        params_str,
+        str(step),
+        f"{cer_pct:.2f}\\%",
+        f"{wer_pct:.2f}\\%",
+        f"{exact_pct:.2f}\\%",
+        f"{tok_acc_pct:.2f}\\%",
+    ]
+    if has_sparsity:
+        row_cols.append(f"{sparsity_mean:.2f}\\%")
+
+    lines = [
+        "\\documentclass{article}",
+        "\\usepackage{booktabs}",
+        "\\usepackage{graphicx}",
+        "\\usepackage{geometry}",
+        "\\usepackage[T1]{fontenc}",
+        "\\geometry{margin=0.5in}",
+        "\\begin{document}",
+        "",
+        "\\begin{table}[h!]",
+        "\\centering\\small",
+        f"\\caption{{ASR Evaluation Results — {args.dataset} {args.split} split, {decoding} decoding.}}",
+        "\\resizebox{\\textwidth}{!}{%",
+        f"\\begin{{tabular}}{{{col_def}}}",
+        "\\toprule",
+        " & ".join(header_cols) + " \\\\",
+        "\\midrule",
+        " & ".join(row_cols) + " \\\\",
+    ]
+
+    # per-layer sparsity block
+    if has_sparsity and 'act_sparsity_per_layer' in metrics:
+        lines.append("\\midrule")
+        total_layer_cols = len(header_cols)
+        lines.append(
+            f"\\multicolumn{{{total_layer_cols}}}{{l}}"
+            f"{{\\textit{{Per-layer sparsity:}}}} \\\\"
+        )
+        for layer, val in metrics['act_sparsity_per_layer'].items():
+            layer_row = (
+                f"\\multicolumn{{{total_layer_cols}}}{{l}}"
+                f"{{\\quad {layer}: {float(val):.2f}\\%}} \\\\"
+            )
+            lines.append(layer_row)
+
+    lines.extend([
+        "\\bottomrule",
+        "\\end{tabular}",
+        "}",  # end resizebox
+        "\\end{table}",
+        "",
+        "\\end{document}",
+    ])
+
+    with open(filepath, 'w') as f:
+        f.write("\n".join(lines))
+
+    print(f"LaTeX table saved to: {filepath}")
+    return filepath
+
+
 def build_eval_dataloader(dataset: str, split: str, batch_size: int,
-                           num_mfcc: int, max_samples: int, num_workers: int):
+                           num_mfcc: int, max_samples: int, num_workers: int, spm_model_path: Optional[str] = None):
     from sparse_mamba.custom_dataloaders.librosa import create_librosa_raw_classification_dataset
 
     print(f"Loading {dataset} {split} split...")
@@ -205,7 +384,7 @@ def evaluate(
             total_loss += outputs.loss.item()
 
         # collect activation sparsity
-        sparsities = getattr(outputs, 'activation_sparsities', [])
+        sparsities = getattr(outputs, 'all_sparsities', [])
         if sparsities:
             all_sparsities.extend(sparsities)
 
@@ -302,22 +481,25 @@ def save_results(metrics: dict, args, step: int, num_layers: int, hidden_size: i
 
     if 'act_sparsity_mean' in metrics:
         results["activation_sparsity"] = {
-            "mean": round(metrics['act_sparsity_mean'], 6),
-            "min":  round(metrics['act_sparsity_min'],  6),
-            "max":  round(metrics['act_sparsity_max'],  6),
-            "std":  round(metrics['act_sparsity_std'],  6),
+            "mean": round(float(metrics['act_sparsity_mean']), 6),
+            "min":  round(float(metrics['act_sparsity_min']),  6),
+            "max":  round(float(metrics['act_sparsity_max']),  6),
+            "std":  round(float(metrics['act_sparsity_std']),  6),
         }
         if 'act_sparsity_per_layer' in metrics:
             results["activation_sparsity"]["per_layer"] = {
-                k: round(v, 6) for k, v in metrics['act_sparsity_per_layer'].items()
+                k: round(float(v), 6) for k, v in metrics['act_sparsity_per_layer'].items()
             }
-
+            
     with open(filepath, 'w') as f:
         json.dump(results, f, indent=2)
 
     print(f"\nResults saved to: {filepath}")
     return filepath
-
+def load_config(config_path):
+    with open(config_path) as f:
+        cfg = json.load(f)
+    return cfg
 
 # ============================================================================
 # MAIN
@@ -372,38 +554,49 @@ def main():
         num_mfcc=args.num_mfcc,
         max_samples=args.max_samples,
         num_workers=args.num_workers,
+        spm_model_path = "./tokenizer/asr_bpe_librispeech_10000.model",
     )
     print(f"Dataset: {n_classes} classes, input_dim={input_dim}")
 
     # build model with auto-detected architecture
-    from sparse_mamba.custom_models.audio_models.delta_mamba2 import (
-        SparseMamba2DeltaASRConfig, SparseMamba2DeltaASRForCTC
-    )
-    config = SparseMamba2DeltaASRConfig(
-        input_size=input_dim,
-        vocab_size=n_classes,
-        blank_id=0,
-        hidden_size=hidden_size,
-        num_hidden_layers=num_layers,
-        state_size=args.state_size,
-        expand=args.expand,
-        head_dim=args.head_dim,
-        chunk_size=args.chunk_size,
-        return_activation_sparsity=args.return_sparsity,
-        rms_norm=True,
-        use_bias=False,
-        use_conv_bias=True,
-        hidden_act="silu",
-        norm_eps=1e-5,
-        residual_in_fp32=True,
-    )
+    # from sparse_mamba.custom_models.audio_models.delta_mamba2 import (
+    #     SparseMamba2DeltaASRConfig, SparseMamba2DeltaASRForCTC
+    # )
+    # config = SparseMamba2DeltaASRConfig(
+    #     input_size=input_dim,
+    #     vocab_size=n_classes,
+    #     blank_id=0,
+    #     hidden_size=hidden_size,
+    #     num_hidden_layers=num_layers,
+    #     state_size=args.state_size,
+    #     expand=args.expand,
+    #     head_dim=args.head_dim,
+    #     chunk_size=args.chunk_size,
+    #     return_activation_sparsity=args.return_sparsity,
+    #     rms_norm=True,
+    #     use_bias=False,
+    #     use_conv_bias=True,
+    #     hidden_act="silu",
+    #     norm_eps=1e-5,
+    #     residual_in_fp32=True,
+    # )
+    
 
-    model = SparseMamba2DeltaASRForCTC(config).to(device)
+    # model = SparseMamba2DeltaASRForCTC(config).to(device)
 
+    from sparse_mamba.custom_models.audio_models.sparse_mamba2_ctc import SparseMamba2ASRConfig, SparseMamba2ASRForCTC
     # load checkpoint
+    cfg = load_config(args.config)
+    config = SparseMamba2ASRConfig(**cfg)
+    model  = SparseMamba2ASRForCTC(config).to(device)
     model = load_checkpoint(model, state_dict)
+    
+    
     print(f"Checkpoint loaded (step {step})")
-
+# model size
+    total_params, trainable_params = count_parameters(model)
+    print(f"Model size    : {format_params(total_params)} total params "
+        f"({format_params(trainable_params)} trainable)")
     # decoding setup
     use_beam_search = args.beam_size > 1
     if use_beam_search:
@@ -426,16 +619,15 @@ def main():
         verbose=True,
     )
 
-    # print results
     print("\n" + "=" * 50)
     print(f"EVALUATION RESULTS (step {step})")
     print("=" * 50)
+    print(f"Model Size    : {format_params(total_params)}")
     print(f"Loss          : {metrics['loss']:.4f}")
     print(f"CER           : {metrics['cer']:.4f} ({metrics['cer']*100:.2f}%)")
     print(f"WER           : {metrics['wer']:.4f} ({metrics['wer']*100:.2f}%)")
     print(f"Exact Match   : {metrics['exact_match']:.4f} ({metrics['exact_match']*100:.2f}%)")
-    print(f"Token Accuracy: {metrics['token_accuracy']:.4f} ({metrics['token_accuracy']*100:.2f}%)")
-    print(f"Sequences     : {metrics['total_sequences']}")
+    print(f"Token Accuracy: {metrics['token_accuracy']:.4f} ({metrics['token_accuracy']*100:.2f}%)")   
     if 'act_sparsity_mean' in metrics:
         print(f"\nActivation Sparsity:")
         print(f"  Mean : {metrics['act_sparsity_mean']:.4f}")
@@ -450,6 +642,7 @@ def main():
 
     # save to json
     save_results(metrics, args, step, num_layers, hidden_size)
+    save_latex(metrics, args, step, num_layers, hidden_size, total_params)
 
     return metrics
 

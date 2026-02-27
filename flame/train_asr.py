@@ -68,25 +68,55 @@ def levenshtein_distance(seq1, seq2):
 
 
 def calculate_asr_metrics(predictions, targets, idx_to_char=None):
-    metrics = {'cer': 0.0, 'wer': 0.0, 'exact_match': 0.0, 'token_accuracy': 0.0,
-               'total_chars': 0, 'total_words': 0, 'total_sequences': len(predictions)}
+    metrics = {
+        'cer': 0.0, 'wer': 0.0, 'exact_match': 0.0, 'token_accuracy': 0.0,
+        'total_chars': 0, 'total_words': 0, 'total_sequences': len(predictions)
+    }
     if not predictions:
         return metrics
+
     tce = twe = tc = tw = em = tk_c = tk_t = 0
     for pred, target in zip(predictions, targets):
-        pred   = pred.tolist()   if torch.is_tensor(pred)   else list(pred)
+        pred   = pred.tolist() if torch.is_tensor(pred)   else list(pred)
         target = target.tolist() if torch.is_tensor(target) else list(target)
-        pc, tc_ = [p for p in pred if p != 0], [t for t in target if t != 0]
-        tce += levenshtein_distance(pc, tc_); tc += len(tc_)
-        twe += levenshtein_distance(pred, target); tw += len(target)
-        em  += pred == target
-        ml   = min(len(pred), len(target))
-        tk_c += sum(pred[i] == target[i] for i in range(ml))
-        tk_t += max(len(pred), len(target))
-    metrics.update(cer=tce/max(tc,1), wer=twe/max(tw,1),
-                   exact_match=em/len(predictions), token_accuracy=tk_c/max(tk_t,1),
-                   total_chars=tc, total_words=tw)
+
+        # CER — filter blanks, compare character tokens
+        pc  = [p for p in pred   if p != 0]
+        tc_ = [t for t in target if t != 0]
+        tce += levenshtein_distance(pc, tc_)
+        tc  += len(tc_)
+
+        # WER — convert to text, split into words, compare word sequences
+        if idx_to_char:
+            #  pred_text   = "".join([idx_to_char.get(t, "") for t in pc]).replace("▁", " ").strip()
+            pred_text   = "".join([idx_to_char.get(t, "") for t in pc]).replace("▁", " ").strip()
+            target_text = "".join([idx_to_char.get(t, "") for t in tc_]).replace("▁", " ").strip()
+            pred_words   = pred_text.split()
+            target_words = target_text.split()
+        else:
+            # fallback if no idx_to_char — WER will equal CER
+            pred_words   = pc
+            target_words = tc_
+
+        twe += levenshtein_distance(pred_words, target_words)
+        tw  += len(target_words)
+
+        # exact match and token accuracy unchanged
+        em   += pc == tc_
+        ml    = min(len(pc), len(tc_))
+        tk_c += sum(pc[i] == tc_[i] for i in range(ml))
+        tk_t += max(len(pc), len(tc_))
+
+    metrics.update(
+        cer=tce / max(tc, 1),
+        wer=twe / max(tw, 1),
+        exact_match=em / len(predictions),
+        token_accuracy=tk_c / max(tk_t, 1),
+        total_chars=tc,
+        total_words=tw,
+    )
     return metrics
+
 
 
 def decode_predictions_ctc(logits, input_lengths, blank_id=0):
@@ -111,12 +141,13 @@ def build_asr_dataloaders(job_config):
     max_samples = getattr(job_config.training, 'max_samples',  -1)
     num_mfcc    = getattr(job_config.training, 'num_mfcc',     80)
     cache_dir   = getattr(job_config.training, 'cache_dir',    './cache')
+    spm_model_path = getattr(job_config.training, 'spm_model_path', None)
 
     train_loader, val_loader, test_loader, n_classes, seq_len, input_dim, char_to_idx, idx_to_char = \
         create_librosa_raw_classification_dataset(
             bsz=job_config.training.batch_size,
             max_samples=max_samples, num_mfcc=num_mfcc, cache_dir=cache_dir,
-            dataset=dataset, drop_last=True, pin_memory=True,
+            dataset=dataset,spm_model_path=spm_model_path, drop_last=True, pin_memory=True,
             num_workers=job_config.training.num_workers,
         )
 
@@ -337,7 +368,6 @@ def train_step(model, batch, optimizer, scheduler, grad_accum_steps, max_grad_no
                     loss = ctc_loss
 
             last_output = output
-            print("Loss before backward:", loss.item())
             scaler.scale(loss).backward()
         else:
             output = model(input_ids=inputs, labels=labels,
@@ -368,7 +398,12 @@ def train_step(model, batch, optimizer, scheduler, grad_accum_steps, max_grad_no
     optimizer.zero_grad()
 
     act_sparsities = getattr(last_output, 'all_sparsities', [])
-
+    
+    if dist.is_initialized():
+        dist.all_reduce(total_loss, op=dist.ReduceOp.AVG)
+        dist.all_reduce(total_ctc_loss, op=dist.ReduceOp.AVG)
+        dist.all_reduce(total_reg_loss, op=dist.ReduceOp.AVG)
+    
     return total_loss, {
         'loss':              total_loss.item(),
         'loss_ctc':          total_ctc_loss.item(),
@@ -410,7 +445,7 @@ def evaluate(model, dataloader, device, max_batches=None):
         if outputs.all_sparsities:
             all_sparsities.extend(outputs.all_sparsities)
 
-        preds = (model.decode(inputs, input_lengths, use_beam_search=True)
+        preds = (model.decode(inputs, input_lengths, use_beam_search=False)
                  if hasattr(model, 'decode')
                  else decode_predictions_ctc(outputs.logits, input_lengths))
 
