@@ -24,6 +24,7 @@ from flame.asr_registry import build_model
 
 from torchtitan.tools.logging import logger as titan_logger
 from torchtitan.tools import utils
+import contextlib
 
 try:
     import wandb
@@ -394,7 +395,7 @@ def build_asr_dataloaders(job_config, world_size: int, global_rank: int):
     )
 
     if dataset == "librispeech":
-        train_split, val_split, test_split = "train.360", "validation", "test"
+        train_split, val_split, test_split = "train.960", "validation", "test"
     else:
         train_split, val_split, test_split = "train", "validation", "test"
 
@@ -528,6 +529,15 @@ class ASRCheckpointManager:
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler else None,
             'train_state':          self.train_state.state_dict(),
+            'metadata': {
+                'model_name': getattr(self.job_config.model, 'name', None),
+                'config_path': getattr(self.job_config.model, 'config', None),
+                'dataset': getattr(self.job_config.training, 'dataset', None),
+                'num_mfcc': getattr(self.job_config.training, 'num_mfcc', None),
+                'spm_model_path': getattr(self.job_config.training, 'spm_model_path', None),
+                'streaming': getattr(self.job_config.training, 'streaming', None),
+                'mixed_precision_param': getattr(self.job_config.training, 'mixed_precision_param', None),
+            },
         }
         path = self.checkpoint_dir / f"checkpoint_step_{step}.pt"
         torch.save(ckpt, path)
@@ -574,6 +584,7 @@ class ASRCheckpointManager:
 
 def train_step(model, batch, optimizer, scheduler, grad_accum_steps,
                max_grad_norm, device, scaler=None,
+               amp_dtype=None,
                global_step=0, total_steps=1,
                reg_start_value=0.0, reg_target_value=0.0):
 
@@ -588,41 +599,46 @@ def train_step(model, batch, optimizer, scheduler, grad_accum_steps,
     total_ctc_loss = torch.tensor(0.0, device=device)
     total_reg_loss = torch.tensor(0.0, device=device)
     last_output    = None
+    reg_loss       = torch.tensor(0.0, device=device)
 
-    for _ in range(grad_accum_steps):
-        if scaler:
-            with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+    for i in range(grad_accum_steps):
+        # Only sync gradients across GPUs on the LAST accumulation step
+        is_last_accum = (i == grad_accum_steps - 1)
+        sync_ctx = contextlib.nullcontext() if is_last_accum else model.no_sync()
+
+        with sync_ctx:
+            if amp_dtype is not None:
+                with torch.amp.autocast('cuda', dtype=amp_dtype):
+                    output   = model(input_ids=inputs, labels=labels,
+                                     input_lengths=input_lengths,
+                                     target_lengths=target_lengths)
+                    ctc_loss = output.loss / grad_accum_steps
+                    reg_term = getattr(output, 'regularization_term', torch.tensor(0.0, device=device))
+                    reg_loss = reg_lambda * reg_term / grad_accum_steps
+                    loss     = ctc_loss + reg_loss
+                if scaler is not None and scaler.is_enabled():
+                    scaler.scale(loss).backward()
+                else:
+                    loss.backward()
+            else:
                 output   = model(input_ids=inputs, labels=labels,
                                  input_lengths=input_lengths,
                                  target_lengths=target_lengths)
                 ctc_loss = output.loss / grad_accum_steps
-                reg_term = getattr(output, 'regularization_term', None)
-                reg_loss = (reg_lambda * reg_term / grad_accum_steps
-                            if reg_term is not None and reg_lambda > 0.0
-                            else torch.tensor(0.0, device=device))
-                loss = ctc_loss + reg_loss
-            scaler.scale(loss).backward()
-        else:
-            output   = model(input_ids=inputs, labels=labels,
-                             input_lengths=input_lengths,
-                             target_lengths=target_lengths)
-            ctc_loss = output.loss / grad_accum_steps
-            reg_term = getattr(output, 'regularization_term', None)
-            reg_loss = (reg_lambda * reg_term / grad_accum_steps
-                        if reg_term is not None and reg_lambda > 0.0
-                        else torch.tensor(0.0, device=device))
-            loss = ctc_loss + reg_loss
-            loss.backward()
+                reg_term = getattr(output, 'regularization_term', torch.tensor(0.0, device=device))
+                reg_loss = reg_lambda * reg_term / grad_accum_steps
+                loss     = ctc_loss + reg_loss
+                loss.backward()
 
         last_output    = output
         total_loss     += loss.detach()
         total_ctc_loss += ctc_loss.detach()
-        total_reg_loss += reg_loss.detach()
+        total_reg_loss += reg_term.detach()
 
-    if scaler:
+    if scaler is not None and scaler.is_enabled():
         scaler.unscale_(optimizer)
     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
-    if scaler:
+    if scaler is not None and scaler.is_enabled():
         scaler.step(optimizer)
         scaler.update()
     else:
@@ -745,9 +761,14 @@ def main(job_config: JobConfig):
     # 5. Optimizer and scheduler operate on the DDP wrapper — that's fine
     optimizer = build_asr_optimizer(model, job_config)
     scheduler = build_asr_scheduler(optimizer, job_config)
-    scaler    = (torch.cuda.amp.GradScaler()
-                 if job_config.training.mixed_precision_param == "bfloat16"
-                 else None)
+    mixed_precision = getattr(job_config.training, 'mixed_precision_param', None)
+    if mixed_precision in ("bfloat16", "bf16"):
+        amp_dtype = torch.bfloat16
+    elif mixed_precision in ("float16", "fp16", "half"):
+        amp_dtype = torch.float16
+    else:
+        amp_dtype = None
+    scaler = torch.cuda.amp.GradScaler(enabled=(amp_dtype == torch.float16))
 
     # 6. Train state and checkpoint manager
     train_state = ASRTrainState()
@@ -795,11 +816,16 @@ def main(job_config: JobConfig):
             job_config.training.gradient_accumulation_steps,
             job_config.training.max_norm,
             device, scaler,
+            amp_dtype=amp_dtype,
             global_step=global_step,
             total_steps=job_config.training.steps,
             reg_start_value=getattr(job_config.training, 'reg_start_value', 0.0),
             reg_target_value=getattr(job_config.training, 'reg_target_value', 0.0),
         )
+        
+        loss_tensor = torch.tensor(metrics['loss'], device=device)
+        dist.all_reduce(loss_tensor, op=dist.ReduceOp.AVG)
+        metrics['loss'] = loss_tensor.item()
 
         # Logging — only rank-0 prints / logs to wandb
         if global_step % job_config.metrics.log_freq == 0 and is_main_process():
@@ -828,6 +854,7 @@ def main(job_config: JobConfig):
                     })
                 wandb.log(wandb_log)
 
+
         # Validation — only rank-0 evaluates to avoid redundant computation
         if global_step % (job_config.metrics.log_freq * 10) == 0 and is_main_process():
             val_metrics = evaluate(model, val_loader, device, max_batches=50)
@@ -847,9 +874,13 @@ def main(job_config: JobConfig):
 
             ckpt_mgr.save(global_step, is_best=is_best)
 
+        dist.barrier()
+
         # All ranks must hit this barrier together before moving to the next step.
         # This prevents rank-0 from racing ahead while others are still in backward.
-        dist.barrier()
+        
+
+    ckpt_mgr.save(global_step, force=True, is_best=False)
 
     # Final test evaluation on rank-0 only
     if is_main_process():
