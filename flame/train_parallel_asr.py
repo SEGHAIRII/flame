@@ -19,7 +19,6 @@ from torch.utils.data.distributed import DistributedSampler
 
 from flame.config_manager import JobConfig
 from flame.logging_timeseries import TimeSeriesLogger
-from sparse_mamba.custom_dataloaders.librosa import create_librosa_raw_classification_dataset
 from flame.asr_registry import build_model
 
 from torchtitan.tools.logging import logger as titan_logger
@@ -154,6 +153,15 @@ def decode_predictions_ctc(logits, input_lengths, blank_id=0):
             prev = t
         results.append(decoded)
     return results
+
+
+def forward_with_optional_threshold(model, apply_thresholding, **kwargs):
+    try:
+        return model(apply_thresholding=apply_thresholding, **kwargs)
+    except TypeError as exc:
+        if "apply_thresholding" not in str(exc):
+            raise
+        return model(**kwargs)
 
 # def _make_empty_dataset(samples, char_to_idx, idx_to_char, num_mfcc, dataset_name):
 #     """
@@ -384,14 +392,15 @@ def decode_predictions_ctc(logits, input_lengths, blank_id=0):
 #     return train_loader, val_loader, test_loader, train_sampler
 
 def build_asr_dataloaders(job_config, world_size: int, global_rank: int):
-    dataset        = getattr(job_config.training, 'dataset',       'librispeech')
-    max_samples    = getattr(job_config.training, 'max_samples',   -1)
-    num_mfcc       = getattr(job_config.training, 'num_mfcc',      80)
-    spm_model_path = getattr(job_config.training, 'spm_model_path', None)
-    streaming      = getattr(job_config.training, 'streaming',     False)
+    dataset     = getattr(job_config.training, 'dataset',     'librispeech')
+    max_samples = getattr(job_config.training, 'max_samples', -1)
+    cache_dir   = getattr(job_config.training, 'cache_dir',   None)
+
+    if cache_dir is None:
+        raise ValueError("job_config.training.cache_dir must be set to the pre-extracted feature cache directory")
 
     from sparse_mamba.custom_dataloaders.preprocess_ctc import (
-        LibriSpeechASRDataset, collate_fn_ctc
+        CachedASRDataset, collate_fn_ctc
     )
 
     if dataset == "librispeech":
@@ -399,17 +408,10 @@ def build_asr_dataloaders(job_config, world_size: int, global_rank: int):
     else:
         train_split, val_split, test_split = "train", "validation", "test"
 
-    def _make_dataset(split, max_s):
-        return LibriSpeechASRDataset(
-            split=split, max_samples=max_s, num_mfcc=num_mfcc,
-            dataset=dataset, spm_model_path=spm_model_path, streaming=streaming,
-        )
-
-    # Every rank loads metadata independently from HF disk cache (fast, tiny RAM)
-    # DistributedSampler handles the round-robin sharding across GPUs
-    train_ds = _make_dataset(train_split, max_samples)
-    val_ds   = _make_dataset(val_split,  max_samples) if global_rank == 0 else None
-    test_ds  = _make_dataset(test_split, max_samples) if global_rank == 0 else None
+    # Every rank loads train; val/test only on rank-0 (evaluated there)
+    train_ds = CachedASRDataset(cache_dir, train_split, max_samples)
+    val_ds   = CachedASRDataset(cache_dir, val_split,   max_samples) if global_rank == 0 else None
+    test_ds  = CachedASRDataset(cache_dir, test_split,  max_samples) if global_rank == 0 else None
 
     train_sampler = DistributedSampler(
         train_ds, num_replicas=world_size, rank=global_rank,
@@ -434,9 +436,13 @@ def build_asr_dataloaders(job_config, world_size: int, global_rank: int):
         collate_fn=collate_fn_ctc, num_workers=nw, pin_memory=True,
     )
 
+    # input_dim is inferred from the first cached sample's feature tensor
+    sample_features = train_ds[0]['features']
+    input_dim = sample_features.size(0)
+
     for loader in (train_loader, val_loader, test_loader):
         loader.n_classes   = len(train_ds.char_to_idx)
-        loader.input_dim   = num_mfcc
+        loader.input_dim   = input_dim
         loader.seq_len     = -1
         loader.char_to_idx = train_ds.char_to_idx
         loader.idx_to_char = train_ds.idx_to_char
@@ -548,14 +554,18 @@ class ASRCheckpointManager:
 
         if self.keep_latest_k > 0:
             for old in sorted(
-                self.checkpoint_dir.glob("checkpoint_step_*.pt")
+                self.checkpoint_dir.glob("checkpoint_step_*.pt"),
+                key=lambda p: int(p.stem.split('_')[-1])
             )[: -self.keep_latest_k]:
                 old.unlink()
 
     def load(self, step=-1):
         """All ranks load the same checkpoint (weights are replicated by DDP)."""
         if step == -1:
-            ckpts = sorted(self.checkpoint_dir.glob("checkpoint_step_*.pt"))
+            ckpts = sorted(
+                self.checkpoint_dir.glob("checkpoint_step_*.pt"),
+                key=lambda p: int(p.stem.split('_')[-1])
+            )
             if not ckpts:
                 titan_logger.info("No checkpoint found — starting from scratch")
                 return 0
@@ -586,12 +596,15 @@ def train_step(model, batch, optimizer, scheduler, grad_accum_steps,
                max_grad_norm, device, scaler=None,
                amp_dtype=None,
                global_step=0, total_steps=1,
-               reg_start_value=0.0, reg_target_value=0.0):
+               reg_start_value=0.0, reg_target_value=0.0,
+               apply_thresholding=False):
 
     inputs         = batch['features'].to(device, dtype=torch.float32).transpose(1, 2)
     labels         = batch['targets'].to(device, dtype=torch.long)
     input_lengths  = batch['feature_lengths'].to(device, dtype=torch.long)
     target_lengths = batch['target_lengths'].to(device, dtype=torch.long)
+    # T = inputs.size(1)
+    # attention_mask = (torch.arange(T, device=device).unsqueeze(0) < input_lengths.unsqueeze(1)).long()
 
     reg_lambda = Reg_Schedular(global_step, total_steps, reg_start_value, reg_target_value)
 
@@ -609,9 +622,21 @@ def train_step(model, batch, optimizer, scheduler, grad_accum_steps,
         with sync_ctx:
             if amp_dtype is not None:
                 with torch.amp.autocast('cuda', dtype=amp_dtype):
-                    output   = model(input_ids=inputs, labels=labels,
-                                     input_lengths=input_lengths,
-                                     target_lengths=target_lengths)
+                    # output = forward_with_optional_threshold(
+                    #     model,
+                    #     apply_thresholding,
+                    #     input_ids=inputs,
+                    #     labels=labels,
+                    #     input_lengths=input_lengths,
+                    #     target_lengths=target_lengths,
+                    # )
+                    output = model(
+                        # apply_thresholding=apply_thresholding,
+                        input_ids=inputs,
+                        labels=labels,
+                        input_lengths=input_lengths,
+                        target_lengths=target_lengths,
+                    )
                     ctc_loss = output.loss / grad_accum_steps
                     reg_term = getattr(output, 'regularization_term', torch.tensor(0.0, device=device))
                     reg_loss = reg_lambda * reg_term / grad_accum_steps
@@ -621,9 +646,21 @@ def train_step(model, batch, optimizer, scheduler, grad_accum_steps,
                 else:
                     loss.backward()
             else:
-                output   = model(input_ids=inputs, labels=labels,
-                                 input_lengths=input_lengths,
-                                 target_lengths=target_lengths)
+                # output = forward_with_optional_threshold(
+                #     model,
+                #     apply_thresholding,
+                #     input_ids=inputs,
+                #     labels=labels,
+                #     input_lengths=input_lengths,
+                #     target_lengths=target_lengths,
+                # )
+                output = model(
+                    # apply_thresholding=apply_thresholding,
+                    input_ids=inputs,
+                    labels=labels,
+                    input_lengths=input_lengths,
+                    target_lengths=target_lengths,
+                )
                 ctc_loss = output.loss / grad_accum_steps
                 reg_term = getattr(output, 'regularization_term', torch.tensor(0.0, device=device))
                 reg_loss = reg_lambda * reg_term / grad_accum_steps
@@ -667,7 +704,7 @@ def train_step(model, batch, optimizer, scheduler, grad_accum_steps,
 # ============================================================================
 
 @torch.no_grad()
-def evaluate(model, dataloader, device, max_batches=None):
+def evaluate(model, dataloader, device, max_batches=None, apply_thresholding=True):
     """
     Called only on rank-0. We unwrap DDP so we can call model.decode()
     which is defined on the raw model class, not on the DDP wrapper.
@@ -688,18 +725,28 @@ def evaluate(model, dataloader, device, max_batches=None):
         labels         = batch['targets'].to(device, dtype=torch.long)
         input_lengths  = batch['feature_lengths'].to(device, dtype=torch.long)
         target_lengths = batch['target_lengths'].to(device, dtype=torch.long)
-
-        outputs = raw_model(input_ids=inputs, labels=labels,
-                            input_lengths=input_lengths,
-                            target_lengths=target_lengths)
+        # T = inputs.size(1)
+        # attention_mask = (torch.arange(T, device=device).unsqueeze(0) < input_lengths.unsqueeze(1)).long()
+        # outputs = forward_with_optional_threshold(
+        #     raw_model,
+        #     apply_thresholding,
+        #     input_ids=inputs,
+        #     labels=labels,
+        #     input_lengths=input_lengths,
+        #     target_lengths=target_lengths,
+        # )
+        outputs = raw_model(
+            input_ids=inputs,
+            labels=labels,
+            input_lengths=input_lengths,
+            target_lengths=target_lengths,
+        )
         total_loss += outputs.loss.item()
 
         if outputs.all_sparsities:
             all_sparsities.extend(outputs.all_sparsities)
 
-        preds = (raw_model.decode(inputs, input_lengths, use_beam_search=False)
-                 if hasattr(raw_model, 'decode')
-                 else decode_predictions_ctc(outputs.logits, input_lengths))
+        preds = decode_predictions_ctc(outputs.logits, input_lengths)
 
         start = 0
         for j in range(len(preds)):
@@ -776,8 +823,9 @@ def main(job_config: JobConfig):
     ckpt_mgr    = ASRCheckpointManager(ckpt_dir, model, optimizer, scheduler,
                                        train_state, job_config)
 
-    if job_config.checkpoint.load_step >= 0:
+    if job_config.checkpoint.load_step >= -1:
         # All ranks must call load() so weights stay in sync
+        # load_step = -1 → load latest, >= 0 → load specific step, -2 → start from scratch
         train_state.step = ckpt_mgr.load(job_config.checkpoint.load_step)
 
     # 7. WandB — only on rank-0
@@ -792,6 +840,7 @@ def main(job_config: JobConfig):
     gc_handler  = utils.GarbageCollection(gc_freq=job_config.training.gc_freq)
     global_step = train_state.step
     train_iter  = iter(train_loader)
+    # apply_thresholding = getattr(job_config.training, 'apply_thresholding', True)
 
     if is_main_process():
         titan_logger.info(f"Starting training from step {global_step}")
@@ -821,6 +870,7 @@ def main(job_config: JobConfig):
             total_steps=job_config.training.steps,
             reg_start_value=getattr(job_config.training, 'reg_start_value', 0.0),
             reg_target_value=getattr(job_config.training, 'reg_target_value', 0.0),
+            # apply_thresholding=apply_thresholding,
         )
         
         loss_tensor = torch.tensor(metrics['loss'], device=device)
@@ -880,7 +930,7 @@ def main(job_config: JobConfig):
         # This prevents rank-0 from racing ahead while others are still in backward.
         
 
-    ckpt_mgr.save(global_step, force=True, is_best=False)
+    ckpt_mgr.save(global_step, force=True, is_best=True)
 
     # Final test evaluation on rank-0 only
     if is_main_process():

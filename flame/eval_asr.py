@@ -103,6 +103,8 @@ def decode_ctc_greedy(logits, input_lengths, blank_id=0):
 
 def load_model(config_path: str, checkpoint_path: str, device: torch.device,
                model_name: str = "sparse_mamba2_asr"):
+    print(f"[1/4] Importing model class for '{model_name}' "
+          f"(may trigger Triton JIT compilation — can take several minutes) ...", flush=True)
     if model_name == "hgrn_asr":
         from sparse_mamba.custom_models.audio_models.hgrn import (
             HGRNASRConfig as CfgClass,
@@ -120,7 +122,7 @@ def load_model(config_path: str, checkpoint_path: str, device: torch.device,
         )
     elif model_name == "sparse_mamba2_asr_noconv":
         from sparse_mamba.custom_models.audio_models.mamba2_noconv import (
-            SparseMamba2ASRConfig as CfgClass,
+            SparseMamba2ASRNoConvConfig as CfgClass,
             SparseMamba2ASRForCTC as ModelClass,
         )
     else:
@@ -128,31 +130,37 @@ def load_model(config_path: str, checkpoint_path: str, device: torch.device,
             f"Unknown --model_name '{model_name}'. "
             f"Choose from: hgrn_asr, sparse_mamba2_asr, sparse_mamba2_delta_asr, sparse_mamba2_asr_noconv"
         )
+    print("[1/4] Model class imported.", flush=True)
 
     # 1. Load config with same path as training registry
+    print(f"[2/4] Loading config from {config_path} ...", flush=True)
     if os.path.exists(config_path):
         config = CfgClass.from_pretrained(config_path)
     else:
         with open(config_path) as f:
             cfg = json.load(f)
         config = CfgClass(**cfg)
-    print(f"Config loaded — hidden={config.hidden_size}, "
-          f"layers={config.num_hidden_layers}, vocab={config.vocab_size}")
+    print(f"[2/4] Config loaded — hidden={config.hidden_size}, "
+          f"layers={config.num_hidden_layers}, vocab={config.vocab_size}", flush=True)
 
     # 2. Build model
+    print(f"[3/4] Building model and moving to {device} ...", flush=True)
     model = ModelClass(config).to(device)
+    print("[3/4] Model built.", flush=True)
 
     # 3. Load checkpoint
+    print(f"[4/4] Loading checkpoint from {checkpoint_path} ...", flush=True)
     ckpt = torch.load(checkpoint_path, map_location=device)
-    print(f"Checkpoint keys : {list(ckpt.keys())}")
-    print(f"Saved at step   : {ckpt.get('step', 'unknown')}")
-    print(f"Best val CER    : {ckpt.get('train_state', {}).get('best_val_cer', 'unknown')}")
+    print(f"[4/4] Checkpoint keys : {list(ckpt.keys())}", flush=True)
+    print(f"      Saved at step   : {ckpt.get('step', 'unknown')}")
+    print(f"      Best val CER    : {ckpt.get('train_state', {}).get('best_val_cer', 'unknown')}")
 
     state_dict = ckpt['model_state_dict']
-    print("First 5 keys in checkpoint:", list(state_dict.keys())[:5])
-    print("First 5 keys in model:", list(model.state_dict().keys())[:5])
+    print("      First 5 keys in checkpoint:", list(state_dict.keys())[:5])
+    print("      First 5 keys in model:", list(model.state_dict().keys())[:5])
 
     # Verify a weight actually changes after loading
+    print("      Loading state dict ...", flush=True)
     sample_key = next(iter(state_dict))
     before = model.state_dict()[sample_key].flatten()[:3].clone()
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
@@ -172,11 +180,12 @@ def load_model(config_path: str, checkpoint_path: str, device: torch.device,
         raise RuntimeError(f"Missing keys: {missing}")
 
     after = model.state_dict()[sample_key].flatten()[:3]
-    print(f"Weight check — before: {before.tolist()}")
-    print(f"Weight check — after : {after.tolist()}")
+    print(f"      Weight check — before: {before.tolist()}")
+    print(f"      Weight check — after : {after.tolist()}")
     assert not torch.allclose(before, after), "Weights did NOT change — checkpoint not loaded!"
 
     model.eval()
+    print("      Checkpoint loaded successfully.", flush=True)
     return model, config
 
 
@@ -184,16 +193,14 @@ def load_model(config_path: str, checkpoint_path: str, device: torch.device,
 # DATALOADER  — uses exact same code path as training
 # ============================================================================
 
-def build_test_loader(dataset: str, split: str, batch_size: int,
-                      num_mfcc: int, max_samples: int, num_workers: int,
-                      spm_model_path: Optional[str] = None,
-                      streaming: bool = False):
+def build_test_loader(cache_dir: str, split: str, batch_size: int,
+                      max_samples: int, num_workers: int):
     """
-    Uses LibriSpeechASRDataset + collate_fn_ctc — identical to training.
-    This guarantees feature extraction is byte-for-byte the same.
+    Loads pre-extracted .pt feature files produced by
+    scripts/preprocess_features.py — no audio decoding, no HF Arrow seeks.
     """
     from sparse_mamba.custom_dataloaders.preprocess_ctc import (
-        LibriSpeechASRDataset, collate_fn_ctc
+        CachedASRDataset, collate_fn_ctc
     )
 
     split_map = {
@@ -202,17 +209,10 @@ def build_test_loader(dataset: str, split: str, batch_size: int,
         'validation': 'validation',
         'test':       'test',
     }
-    hf_split = split_map.get(split, split)
+    cache_split = split_map.get(split, split)
 
-    print(f"Loading {dataset} / {hf_split} ...")
-    ds = LibriSpeechASRDataset(
-        split=hf_split,
-        max_samples=max_samples,
-        num_mfcc=num_mfcc,
-        dataset=dataset,
-        spm_model_path=spm_model_path,
-        streaming=streaming,
-    )
+    print(f"Loading cached features from {cache_dir}/{cache_split} ...")
+    ds = CachedASRDataset(cache_dir, cache_split, max_samples)
 
     loader = torch.utils.data.DataLoader(
         ds,
@@ -317,15 +317,12 @@ def parse_args():
     p.add_argument("--config",      required=True)
     p.add_argument("--split",       default="test",
                    choices=["train", "val", "validation", "test"])
+    p.add_argument("--cache_dir",   required=True,
+                   help="Root directory of pre-extracted .pt files (--cache_dir from preprocess_features.py).")
     p.add_argument("--dataset",     default="librispeech",
-                   choices=["librispeech", "peoples_speech"])
+                   choices=["librispeech", "peoples_speech"],
+                   help="Only used for output metadata.")
     p.add_argument("--batch_size",  type=int, default=32)
-    p.add_argument("--num_mfcc",    type=int, default=None,
-                   help="Feature dimension. Defaults to config.input_size when not provided.")
-    p.add_argument("--spm_model_path", default=None,
-                   help="SentencePiece model path used during training.")
-    p.add_argument("--streaming", action="store_true",
-                   help="Use streaming dataset mode (should match training setting).")
     p.add_argument("--max_samples", type=int, default=-1)
     p.add_argument("--max_batches", type=int, default=-1)
     p.add_argument("--num_workers", type=int, default=4)
@@ -346,32 +343,31 @@ def main():
     args   = parse_args()
     device = torch.device(args.device) if args.device else \
              torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
+    print(f"Device: {device}", flush=True)
 
     # 1. Load model
     model, config = load_model(args.config, args.checkpoint, device, args.model_name)
     total = sum(p.numel() for p in model.parameters())
-    print(f"Parameters: {total/1e6:.2f}M")
+    print(f"Parameters: {total/1e6:.2f}M", flush=True)
 
-    # 2. Build dataloader (same code path as training)
-    effective_num_mfcc = args.num_mfcc if args.num_mfcc is not None else int(config.input_size)
+    # 2. Build dataloader from pre-extracted cache
+    print("\n[Step 2] Building dataloader ...", flush=True)
     loader = build_test_loader(
-        dataset=args.dataset,
+        cache_dir=args.cache_dir,
         split=args.split,
         batch_size=args.batch_size,
-        num_mfcc=effective_num_mfcc,
         max_samples=args.max_samples,
         num_workers=args.num_workers,
-        spm_model_path=args.spm_model_path,
-        streaming=args.streaming,
     )
+    print("[Step 2] Dataloader ready.", flush=True)
 
     # 3. Sanity-check: features should look reasonable
+    print("\n[Step 3] Sanity-checking first batch ...", flush=True)
     batch = next(iter(loader))
     sample = batch['features'].to(device, dtype=torch.float32).transpose(1, 2)
-    print(f"\nFeature shape : {sample.shape}")
+    print(f"Feature shape : {sample.shape}")
     print(f"Feature mean  : {sample.mean():.4f}  (training used ~0)")
-    print(f"Feature std   : {sample.std():.4f}   (training used ~0.5-1)")
+    print(f"Feature std   : {sample.std():.4f}   (training used ~0.5-1)", flush=True)
 
     # 4. Evaluate
     # print(f"\nEvaluating {args.dataset} {args.split} ...")
@@ -380,7 +376,7 @@ def main():
 
 
     # 4. Evaluate
-    print(f"\nEvaluating {args.dataset} {args.split} ...")
+    print(f"\n[Step 4] Evaluating {args.dataset} {args.split} ...", flush=True)
     metrics = evaluate(model, loader, device,
                        max_batches=args.max_batches, verbose=True)
     # 5. Print results

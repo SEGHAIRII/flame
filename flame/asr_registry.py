@@ -109,7 +109,7 @@ def _build_hgrn_asr(job_config: JobConfig, metadata: dict) -> nn.Module:
 
 
 @register_asr_model("hgrn_delta")
-def _build_hgrn_asr(job_config: JobConfig, metadata: dict) -> nn.Module:
+def _build_hgrn_delta(job_config: JobConfig, metadata: dict) -> nn.Module:
     from sparse_mamba.custom_models.audio_models.hgrn_delta import HGRNASRConfig, HGRNASRForCTC 
 
     config_path = _cfg(job_config, "config", None)
@@ -259,14 +259,14 @@ def _build_sparse_mamba2_delta_asr(job_config: JobConfig, metadata: dict) -> nn.
 
 @register_asr_model("sparse_mamba2_asr_noconv")
 def _build_sparse_mamba2_asr_noconv(job_config: JobConfig, metadata: dict) -> nn.Module:
-    from sparse_mamba.custom_models.audio_models.mamba2_noconv import SparseMamba2ASRConfig, SparseMamba2ASRForCTC
+    from sparse_mamba.custom_models.audio_models.mamba2_noconv import SparseMamba2ASRNoConvConfig, SparseMamba2ASRForCTC
 
     config_path = _cfg(job_config, "config", None)
 
     if config_path and os.path.exists(config_path):
-        config = SparseMamba2ASRConfig.from_pretrained(config_path)
+        config = SparseMamba2ASRNoConvConfig.from_pretrained(config_path)
     else:
-        config = SparseMamba2ASRConfig(
+        config = SparseMamba2ASRNoConvConfig(
             # ASR-specific
             input_size=metadata["input_dim"],
             vocab_size=metadata["n_classes"],
