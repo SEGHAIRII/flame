@@ -278,6 +278,60 @@ def calculate_sparsity(model_parts, threshold=1e-5):
 def build_tokenizer(job_config: JobConfig) -> AutoTokenizer:
     return AutoTokenizer.from_pretrained(job_config.model.tokenizer_path)
 
+
+
+def _forward_and_loss(model, input_ids, labels, position_ids, cu_seqlens,
+                      grad_accum_steps, apply_qat_quantization,
+                      reg_loss_weight=0.0):
+    output = model(
+        input_ids=input_ids,
+        labels=labels,
+        position_ids=position_ids,
+        cu_seqlens=cu_seqlens,
+        apply_qat_quantization=apply_qat_quantization,
+    )
+    task_loss = output.loss / grad_accum_steps
+ 
+    reg_term = getattr(output, 'regularization_term', None)
+    if reg_term is not None and reg_loss_weight > 0.0:
+        reg_loss = reg_loss_weight * reg_term / grad_accum_steps
+    else:
+        reg_loss = task_loss.new_zeros(())
+ 
+    return output, task_loss + reg_loss, task_loss, reg_loss
+
+
+def _add_sparsity_metrics(extra_metrics: dict, output) -> None:
+    """
+    Reads output.activation_sparsities (dict or None) and adds to extra_metrics.
+    Compatible with both the new dict format {"input": float, "output": float}
+    and the old list/tuple format for non-delta models.
+    """
+    sp = getattr(output, 'activation_sparsities', None)
+    if sp is None:
+        return
+ 
+    if isinstance(sp, dict):
+        # New format: SparseMamba2DeltaForCausalLM
+        if sp.get('input') is not None:
+            extra_metrics['sparsity/act_input']  = sp['input']
+        if sp.get('output') is not None:
+            extra_metrics['sparsity/act_output'] = sp['output']
+    elif hasattr(sp, '__iter__'):
+        # Legacy format: list/tuple of per-layer scalars
+        sp_list = list(sp)
+        if sp_list:
+            extra_metrics['sparsity/act_overall'] = sum(sp_list) / len(sp_list)
+            extra_metrics['sparsity/act_min']     = min(sp_list)
+            extra_metrics['sparsity/act_max']     = max(sp_list)
+ 
+    # Regularization term
+    reg = getattr(output, 'regularization_term', None)
+    if reg is not None:
+        val = reg.item() if hasattr(reg, 'item') else float(reg)
+        extra_metrics['loss/reg_term'] = val
+
+
 # to do : see the loss function
 # modify the flops per token calculation...
 
@@ -298,20 +352,20 @@ register_train_spec(
 )
 
 #register audio denoising models
-register_train_spec(
-    TrainSpec(
-        name="audio_denoising_fla",
-        cls=AutoModel,
-        config=AutoConfig,
-        parallelize_fn=parallelize_fla,
-        pipelining_fn=pipeline_fla,
-        build_optimizers_fn=build_optimizers,
-        build_lr_schedulers_fn=build_lr_schedulers,
-        build_dataloader_fn=build_dataloader_audio,
-        build_tokenizer_fn=None,
-        build_loss_fn=None,
-    )
-)
+# register_train_spec(
+#     TrainSpec(
+#         name="audio_denoising_fla",
+#         cls=AutoModel,
+#         config=AutoConfig,
+#         parallelize_fn=parallelize_fla,
+#         pipelining_fn=pipeline_fla,
+#         build_optimizers_fn=build_optimizers,
+#         build_lr_schedulers_fn=build_lr_schedulers,
+#         build_dataloader_fn=build_dataloader_audio,
+#         build_tokenizer_fn=None,
+#         build_loss_fn=None,
+#     )
+# )
 
 
 @record
@@ -685,14 +739,8 @@ def main(job_config: JobConfig):
     erk_sparsities = None
     enable_weight_sparsification = job_config.training.enable_weight_sparsification
     threshold = job_config.training.target_threshold
-    # hard_mamba
-    sparsity_loss_start = 0.0
-    sparsity_loss_end = 1.0
-    sparsity_loss_weight = 0.0
     
-    # tau_start = 1.0
-    # tau_end = 0.1
-    # tau = tau_start
+    
     with (
         maybe_enable_profiling(
             job_config, global_step=train_state.step
@@ -702,8 +750,8 @@ def main(job_config: JobConfig):
         ) as memory_profiler,
     ):
         while train_state.step < job_config.training.steps:
-            sparsity_loss_weight = Threshold_Schedular(train_state.step, job_config.training.steps, sparsity_loss_start, sparsity_loss_end)
-            # tau = Threshold_Schedular(train_state.step, job_config.training.steps, tau_start, tau_end)
+            # sparsity_loss_weight = Threshold_Schedular(train_state.step, job_config.training.steps, sparsity_loss_start, sparsity_loss_end)
+            threshold = Threshold_Schedular(train_state.step, job_config.training.steps, 0.0, job_config.training.target_threshold)    
             train_state.step += 1
             if enable_weight_sparsification:
                 if  train_state.step % update_sparsity_every_n_steps == 0:
@@ -728,16 +776,14 @@ def main(job_config: JobConfig):
              
              # Updating the threshold
              
-            # threshold = Threshold_Schedular(train_state.step, job_config.training.steps, 0.0, job_config.training.target_threshold)    
             
             gc_handler.run(train_state.step)
 
             optimizers.zero_grad()
 
             losses = []
-            # main_losses = []
-            # sparsity_losses = []
-            # do gradient accumulation if enabled
+            task_losses = []
+
             for _ in range(job_config.training.gradient_accumulation_steps):
                 # get batch
                 data_load_start = time.perf_counter()
@@ -821,22 +867,18 @@ def main(job_config: JobConfig):
                     # Non-PP forward / backward
                     with train_context(optional_context_parallel_ctx):
                         with maybe_enable_amp:
-                            output = model(
-                                input_ids=input_ids,
-                                labels=labels,
-                                position_ids=position_ids,
-                                cu_seqlens=cu_seqlens,
-                                threshold=threshold,
-                                # tau=tau,
+                            output, loss, task_loss, reg_loss = _forward_and_loss(
+                                model, input_ids, labels, position_ids, cu_seqlens,
+                                grad_accum_steps=job_config.training.gradient_accumulation_steps,
+                                apply_qat_quantization=False,   # flip to True during QAT
+                                reg_loss_weight=threshold,
                             )
-                        loss = (
-                            output.loss
-                            / job_config.training.gradient_accumulation_steps
-                        )
                         loss.backward()
+                    task_losses.append(task_loss)
 
                 losses.append(loss)
             loss = sum(losses)
+            task_loss_sum = sum(task_losses) if task_losses else None
             #             main_loss = (
             #                 output.loss
             #                 / job_config.training.gradient_accumulation_steps
@@ -885,6 +927,7 @@ def main(job_config: JobConfig):
                 # Logging
                 # ------------------------
             if metric_logger.should_log(train_state.step):
+                global_avg_task_loss = None
                 if (
                     parallel_dims.dp_replicate_enabled
                     or parallel_dims.dp_shard_enabled
@@ -902,9 +945,18 @@ def main(job_config: JobConfig):
                             world_mesh["dp_cp"],
                         ),
                     )
+                    if task_loss_sum is not None:
+                        global_avg_task_loss = dist_utils.dist_mean(
+                            task_loss_sum.detach(),
+                            world_mesh["dp_cp"],
+                        )
                 else:
                     # Scale back the loss before logging
                     global_avg_loss = global_max_loss = loss.item()
+                    if task_loss_sum is not None:
+                        global_avg_task_loss = task_loss_sum.item()
+                if hasattr(global_avg_task_loss, "item"):
+                    global_avg_task_loss = global_avg_task_loss.item()
                 #     loss = loss.detach()
                 #     main_loss_sum = main_loss_sum.detach()
                 #     sparsity_loss_sum = sparsity_loss_sum.detach()
@@ -968,18 +1020,10 @@ def main(job_config: JobConfig):
                         "sparsity/weights_overall": sparsity_metrics["overall_sparsity"],
                         "sparsity/weights_zero_params": sparsity_metrics["zero_params"],
                 }
+                if global_avg_task_loss is not None:
+                    extra_metrics["loss/task"] = global_avg_task_loss
 
-                if output.activation_sparsities:
-                    act_sparsities = output.activation_sparsities
-                    extra_metrics.update({
-                            "sparsity/act_overall": sum(act_sparsities) / len(act_sparsities),
-                            "sparsity/act_min": min(act_sparsities),
-                            "sparsity/act_max": max(act_sparsities),
-                            "sparsity/act_std": torch.tensor(act_sparsities).std().item(),
-                            "sparsity/act_layer_first": act_sparsities[0],
-                            "sparsity/act_layer_middle": act_sparsities[len(act_sparsities) // 2],
-                            "sparsity/act_layer_last": act_sparsities[-1],
-                    })
+                _add_sparsity_metrics(extra_metrics, output)
 
                 metric_logger.log(
                         train_state.step,
