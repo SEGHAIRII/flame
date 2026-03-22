@@ -451,12 +451,14 @@ def build_optimizer(raw_model, args):
             "params":       base_params,
             "lr":           args.lr,
             "weight_decay": args.weight_decay,
+            "group_name":   "base",
         })
     if threshold_params:
         param_groups.append({
             "params":       threshold_params,
             "lr":           args.threshold_lr,
             "weight_decay": 0.0,
+            "group_name":   "thresholds",
         })
 
     optimizer = torch.optim.AdamW(
@@ -468,6 +470,13 @@ def build_optimizer(raw_model, args):
         num_training_steps=args.steps,
     )
     return optimizer, scheduler
+
+
+def _threshold_group_indices(optimizer) -> list[int]:
+    return [
+        i for i, group in enumerate(optimizer.param_groups)
+        if group.get("group_name") == "thresholds"
+    ]
 
 
 # ============================================================================
@@ -572,6 +581,7 @@ def finetune(args):
 
         raw_student          = student
         optimizer, scheduler = build_optimizer(raw_student, args)
+        threshold_group_idxs = _threshold_group_indices(optimizer)
 
         amp_dtype = (
             None if args.mixed_precision == "none"
@@ -614,7 +624,10 @@ def finetune(args):
                 and not thresholds_frozen
                 and step >= freeze_threshold_step
             ):
-                raw_student.set_threshold_trainable(False)
+                for group_idx in threshold_group_idxs:
+                    optimizer.param_groups[group_idx]["lr"] = 0.0
+                    optimizer.param_groups[group_idx]["initial_lr"] = 0.0
+                    scheduler.base_lrs[group_idx] = 0.0
                 thresholds_frozen = True
                 if is_main():
                     print(f"Freezing input/output thresholds at step {step}/{args.steps}.")
@@ -671,6 +684,9 @@ def finetune(args):
             else:
                 optimizer.step()
             scheduler.step()
+            if thresholds_frozen:
+                for group_idx in threshold_group_idxs:
+                    optimizer.param_groups[group_idx]["lr"] = 0.0
 
             # ── Logging — mirrors train.py: all-reduce only at log frequency ─
             if step % args.log_freq == 0:

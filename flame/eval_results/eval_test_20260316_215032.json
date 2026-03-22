@@ -1,0 +1,22 @@
+{
+  "metadata": {
+    "checkpoint": "../../sparse_mamba/checkpoints/qat_delta_l2_reg_w_1.3/latest.pt",
+    "config": "../../sparse_mamba/configs/delta_mamba2_asr.json",
+    "model_name": "sparse_mamba2_delta_asr",
+    "split": "test",
+    "dataset": "librispeech",
+    "apply_qat": true,
+    "step": 10750
+  },
+  "metrics": {
+    "cer": 0.804791,
+    "wer": 0.841647,
+    "exact_match": 0.0,
+    "total_chars": 277841.0,
+    "total_words": 51903.0,
+    "total_sequences": 2611.0,
+    "loss": 0.404914,
+    "sparsity_input": 57.712213,
+    "sparsity_output": 71.805428
+  }
+}

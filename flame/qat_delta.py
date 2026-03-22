@@ -137,6 +137,61 @@ def load_pretrained(model: SparseMamba2DeltaASRForCTC, checkpoint_path: str):
     return model
 
 
+def _strip_wrapper_prefixes(key: str) -> str:
+    while key.startswith("module."):
+        key = key[len("module."):]
+    return key
+
+
+def _map_mamba2_noconv_key_to_delta(key: str) -> str:
+    key = _strip_wrapper_prefixes(key)
+    if key.startswith("sparse_mamba_asr."):
+        return "sparse_mamba_delta_asr." + key[len("sparse_mamba_asr."):]
+    if key.startswith("sparse_mamba2_asr_noconv."):
+        return "sparse_mamba_delta_asr." + key[len("sparse_mamba2_asr_noconv."):]
+    return key
+
+
+def load_mamba2_noconv_into_delta(model: SparseMamba2DeltaASRForCTC, checkpoint_path: str):
+    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    source_state_dict = _extract_state_dict(ckpt)
+    target_state_dict = model.state_dict()
+
+    remapped_state_dict = {}
+    skipped_missing_target = []
+    skipped_shape_mismatch = []
+
+    for src_key, src_value in source_state_dict.items():
+        if not torch.is_tensor(src_value):
+            continue
+
+        dst_key = _map_mamba2_noconv_key_to_delta(src_key)
+        dst_value = target_state_dict.get(dst_key)
+        if dst_value is None:
+            skipped_missing_target.append((src_key, dst_key))
+            continue
+        if src_value.shape != dst_value.shape:
+            skipped_shape_mismatch.append(
+                (src_key, dst_key, tuple(src_value.shape), tuple(dst_value.shape))
+            )
+            continue
+        remapped_state_dict[dst_key] = src_value
+
+    missing, unexpected = model.load_state_dict(remapped_state_dict, strict=False)
+
+    if is_main_process():
+        print(f"Initialized Delta model from Mamba2-no-conv checkpoint: {checkpoint_path}")
+        print(f"  Loaded compatible tensors: {len(remapped_state_dict)}")
+        print(f"  Source keys without Delta target: {len(skipped_missing_target)}")
+        print(f"  Source keys skipped due to shape mismatch: {len(skipped_shape_mismatch)}")
+        if missing:
+            print(f"  Delta keys not loaded (expected for Delta-only params): {len(missing)}")
+        if unexpected:
+            print(f"  Unexpected keys: {len(unexpected)}")
+
+    return model
+
+
 # ============================================================================
 # DATALOADERS
 # ============================================================================
@@ -507,7 +562,10 @@ def finetune(args):
 
         config  = load_config(args.config_path, initial_threshold=args.initial_threshold)
         student = SparseMamba2DeltaASRForCTC(config).to(device)
-        student = load_pretrained(student, args.checkpoint)
+        if args.init_from_mamba2_noconv:
+            student = load_mamba2_noconv_into_delta(student, args.checkpoint)
+        else:
+            student = load_pretrained(student, args.checkpoint)
 
         baseline_metrics      = None
         student_init_metrics  = None
@@ -794,6 +852,12 @@ def parse_args():
     p.add_argument("--config_path",  required=True)
     p.add_argument("--output_dir",   default="./qat_delta_ckpts")
     p.add_argument("--cache_dir",    required=True)
+    p.add_argument(
+        "--init_from_mamba2_noconv",
+        action="store_true",
+        help="Treat --checkpoint as a SparseMamba2-no-conv checkpoint and "
+             "initialize the Delta model with all compatible weights.",
+    )
 
     p.add_argument("--dataset",      default="librispeech")
     p.add_argument("--max_samples",  type=int, default=-1)

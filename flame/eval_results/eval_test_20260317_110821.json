@@ -1,0 +1,22 @@
+{
+  "metadata": {
+    "checkpoint": "../../sparse_mamba/checkpoints/mamba2_relu_13.8m/best_model.pt",
+    "config": "../../sparse_mamba/configs/mamba2_relu_asr.json",
+    "model_name": "sparse_mamba2_asr_noconv",
+    "split": "test",
+    "dataset": "librispeech",
+    "apply_qat": false,
+    "step": 5425
+  },
+  "metrics": {
+    "cer": 0.159498,
+    "wer": 0.488238,
+    "exact_match": 0.006894,
+    "total_chars": 277841.0,
+    "total_words": 51903.0,
+    "total_sequences": 2611.0,
+    "loss": 0.636887,
+    "sparsity_input": 42.136909,
+    "sparsity_output": 82.115571
+  }
+}
